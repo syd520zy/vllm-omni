@@ -13,6 +13,10 @@
 #     cudagraph-compatible. NPU platform flips stage 0 to true where
 #     cudagraph is not yet verified.
 async_chunk: true
+# Optional mode switch (default false keeps current 2-stage behavior):
+# false -> stage0 talker + stage1 code2wav via connector
+# true  -> single-stage in-process fusion (no stage-to-stage transport)
+qwen3_tts_inprocess_fusion: false
 
 connectors:
   connector_of_shared_memory:
@@ -38,6 +42,10 @@ stages:
     async_scheduling: true
     max_num_batched_tokens: 512
     max_model_len: 4096
+    # In-process fusion controls (effective when qwen3_tts_inprocess_fusion=true)
+    tts_inprocess_fusion_enable: false
+    tts_fusion_chunk_frames: 100
+    tts_fusion_left_context_frames: 25
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory

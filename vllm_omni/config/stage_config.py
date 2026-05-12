@@ -461,6 +461,10 @@ class DeployConfig:
     platforms: dict[str, Any] | None = None
     # Overrides the auto-detected pipeline registry key for structural variants.
     pipeline: str | None = None
+    # Qwen3-TTS optional mode switch:
+    # false = default 2-stage talker->code2wav with connector transport;
+    # true  = single-stage in-process fusion (no inter-stage transport).
+    qwen3_tts_inprocess_fusion: bool = False
 
     # === Pipeline-wide engine settings (applied uniformly to every stage) ===
     trust_remote_code: bool | None = None
@@ -616,6 +620,7 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
         "stages": stages,
         "platforms": raw_dict.get("platforms", None),
         "pipeline": raw_dict.get("pipeline", None),
+        "qwen3_tts_inprocess_fusion": bool(raw_dict.get("qwen3_tts_inprocess_fusion", False)),
     }
     # Pipeline-wide engine settings: only set if explicitly present in YAML
     # so the DeployConfig dataclass defaults take effect otherwise.
@@ -1149,6 +1154,12 @@ class StageConfigFactory:
         cli_async_chunk = cli_overrides.get("async_chunk")
         if cli_async_chunk is not None:
             deploy_cfg.async_chunk = bool(cli_async_chunk)
+
+        if model_type == "qwen3_tts" and deploy_cfg.qwen3_tts_inprocess_fusion:
+            if deploy_cfg.pipeline is None:
+                deploy_cfg.pipeline = "qwen3_tts_inprocess"
+            if cli_async_chunk is None:
+                deploy_cfg.async_chunk = False
 
         pipeline_key = deploy_cfg.pipeline or model_type
         if pipeline_key not in _PIPELINE_REGISTRY:

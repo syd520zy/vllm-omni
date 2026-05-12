@@ -2213,13 +2213,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         moss_sample_rate: int | None = None
 
         final_output: OmniRequestOutput | None = None
+        last_non_empty_audio_output: dict[str, Any] | None = None
+        last_non_empty_audio_key: str | None = None
         async for res in generator:
             final_output = res
-            if not is_moss:
-                continue
             try:
                 step_audio, step_key = self._extract_audio_output(res)
             except Exception:
+                step_audio, step_key = {}, None
+            if step_key is not None:
+                step_tensor = step_audio.get(step_key)
+                has_audio = False
+                if isinstance(step_tensor, list):
+                    has_audio = any(hasattr(cand, "numel") and cand.numel() > 0 for cand in step_tensor)
+                else:
+                    has_audio = hasattr(step_tensor, "numel") and step_tensor.numel() > 0
+                if has_audio:
+                    last_non_empty_audio_output = step_audio
+                    last_non_empty_audio_key = step_key
+            if not is_moss:
                 continue
             if step_key is None:
                 continue
@@ -2237,10 +2249,22 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             raise ValueError("No output generated from the model.")
 
         audio_output, audio_key = self._extract_audio_output(final_output)
+        if audio_key is None and last_non_empty_audio_key is not None and last_non_empty_audio_output is not None:
+            audio_output, audio_key = last_non_empty_audio_output, last_non_empty_audio_key
         if audio_key is None:
             raise ValueError("TTS model did not produce audio output.")
 
         audio_tensor = audio_output[audio_key]
+        if (
+            last_non_empty_audio_key is not None
+            and last_non_empty_audio_output is not None
+            and (
+                (isinstance(audio_tensor, list) and not any(hasattr(c, "numel") and c.numel() > 0 for c in audio_tensor))
+                or (not isinstance(audio_tensor, list) and (not hasattr(audio_tensor, "numel") or audio_tensor.numel() <= 0))
+            )
+        ):
+            audio_output, audio_key = last_non_empty_audio_output, last_non_empty_audio_key
+            audio_tensor = audio_output[audio_key]
         sr_raw = audio_output.get("sr", 24000)
         sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)

@@ -46,3 +46,26 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
         ),
     ),
 )
+
+# Single-stage topology: talker does in-process code2wav and returns audio
+# directly from stage 0 (no inter-stage connector communication).
+QWEN3_TTS_INPROCESS_PIPELINE = PipelineConfig(
+    model_type="qwen3_tts_inprocess",
+    model_arch="Qwen3TTSTalkerForConditionalGeneration",
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="qwen3_tts",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            final_output=True,
+            final_output_type="audio",
+            engine_output_type="audio",
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [2150],
+            },
+        ),
+    ),
+)

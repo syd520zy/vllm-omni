@@ -354,6 +354,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             record_function_or_nullcontext("gpu_model_runner: preprocess"),
             self.synchronize_input_prep(),
         ):
+            finished_info_by_req = {
+                rid: self.model_intermediate_buffer.get(rid)
+                for rid in (getattr(scheduler_output, "finished_req_ids", set()) or set())
+            }
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
 
@@ -398,6 +402,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if kv_ids:
                     output = copy(output)
                     output.kv_extracted_req_ids = kv_ids
+
+                tail_flush_output = self._maybe_flush_finished_inprocess_tts(
+                    scheduler_output,
+                    finished_info_by_req=finished_info_by_req,
+                    kv_connector_output=getattr(output, "kv_connector_output", None),
+                    ec_connector_output=getattr(output, "ec_connector_output", None),
+                    kv_extracted_req_ids=kv_ids,
+                )
+                if tail_flush_output is not None:
+                    return tail_flush_output
 
                 return output
 
@@ -710,6 +724,135 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # Prefix caching is disabled
         return hidden_states_cpu[start:end]
 
+    def _current_step_finished_req_ids(
+        self,
+        req_ids_output_copy: list[str],
+        valid_sampled_token_ids: Any,
+    ) -> set[str]:
+        eos_id = getattr(self.model, "_codec_eos_token_id", None)
+        if eos_id is None:
+            return set()
+        try:
+            eos_id = int(eos_id)
+        except (TypeError, ValueError):
+            return set()
+
+        finished: set[str] = set()
+        for idx, rid in enumerate(req_ids_output_copy):
+            token_ids = None
+            try:
+                token_ids = valid_sampled_token_ids[idx]
+            except (IndexError, TypeError):
+                continue
+            if isinstance(token_ids, torch.Tensor):
+                if token_ids.numel() == 0:
+                    continue
+                sampled = token_ids.reshape(-1).tolist()
+            elif isinstance(token_ids, (list, tuple)):
+                sampled = list(token_ids)
+            else:
+                sampled = [token_ids]
+            if eos_id in {int(t) for t in sampled if t is not None}:
+                finished.add(rid)
+        return finished
+
+    def _maybe_flush_finished_inprocess_tts(
+        self,
+        scheduler_output: SchedulerOutput,
+        finished_info_by_req: dict[str, object] | None = None,
+        kv_connector_output: Any = None,
+        ec_connector_output: Any = None,
+        kv_extracted_req_ids: list[str] | None = None,
+    ) -> OmniModelRunnerOutput | None:
+        decode_inprocess_tts = getattr(self.model, "maybe_decode_inprocess_tts_chunks", None)
+        if not callable(decode_inprocess_tts):
+            return None
+
+        finished_req_ids = list(getattr(scheduler_output, "finished_req_ids", set()) or [])
+        if not finished_req_ids:
+            return None
+
+        pending_req_ids = []
+        for rid in finished_req_ids:
+            info = None
+            if finished_info_by_req is not None:
+                info = finished_info_by_req.get(rid)
+            if info is None:
+                info = self.model_intermediate_buffer.get(rid)
+            if isinstance(info, dict) and info.get("_tts_fusion_all_codes") is not None:
+                pending_req_ids.append(rid)
+        if not pending_req_ids:
+            return None
+
+        logger.info(
+            "[Qwen3TTS][inprocess_fusion] tail_flush req_ids=%s",
+            sorted(pending_req_ids),
+        )
+        info_by_req = {
+            rid: (
+                finished_info_by_req.get(rid)
+                if finished_info_by_req is not None and isinstance(finished_info_by_req.get(rid), dict)
+                else self.model_intermediate_buffer.get(rid, {})
+            )
+            for rid in pending_req_ids
+        }
+        inprocess_audio_outputs = decode_inprocess_tts(
+            pending_req_ids,
+            info_by_req,
+            set(pending_req_ids),
+        )
+
+        inprocess_audio_by_req: dict[str, dict[str, object]] = {}
+        for mm_key, values in inprocess_audio_outputs.items():
+            if not isinstance(values, list):
+                continue
+            for out_pos, rid in enumerate(pending_req_ids):
+                if out_pos >= len(values) or values[out_pos] is None:
+                    continue
+                value = values[out_pos]
+                if isinstance(value, torch.Tensor):
+                    value = value.detach().to("cpu").contiguous()
+                inprocess_audio_by_req.setdefault(rid, {})[mm_key] = value
+
+        output_req_ids = [
+            rid for rid in pending_req_ids
+            if inprocess_audio_by_req.get(rid)
+        ]
+        if not output_req_ids:
+            logger.debug(
+                "[Qwen3TTS][inprocess_fusion] tail_flush produced no audio req_ids=%s",
+                sorted(pending_req_ids),
+            )
+            return None
+
+        logger.info(
+            "[Qwen3TTS][inprocess_fusion] tail_flush_output req_ids=%s keys=%s",
+            sorted(output_req_ids),
+            {
+                rid: sorted(inprocess_audio_by_req[rid].keys())
+                for rid in output_req_ids
+            },
+        )
+        output = OmniModelRunnerOutput(
+            req_ids=output_req_ids,
+            req_id_to_index={
+                rid: idx for idx, rid in enumerate(output_req_ids)
+            },
+            sampled_token_ids=[[] for _ in output_req_ids],
+            logprobs=None,
+            prompt_logprobs_dict={},
+            pooler_output=[
+                flatten_payload(inprocess_audio_by_req[rid])
+                for rid in output_req_ids
+            ],
+            kv_connector_output=kv_connector_output,
+            ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+            num_nans_in_logits={},
+            cudagraph_stats=None,
+        )
+        output.kv_extracted_req_ids = kv_extracted_req_ids
+        return output
+
     @torch.inference_mode()
     def sample_tokens(
         self,
@@ -871,6 +1014,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
+        omit_hidden_pooler_output = bool(getattr(self.model, "omit_hidden_pooler_output", False))
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         if needs_pooler_payload:
@@ -878,7 +1022,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
             )
-            if len(downstream_req_ids) == len(req_ids_output_copy):
+            if omit_hidden_pooler_output:
+                hidden_states_cpu = None
+            elif len(downstream_req_ids) == len(req_ids_output_copy):
                 hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
             else:
                 req_hidden_states_cpu = {}
@@ -905,7 +1051,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     scheduler_output.num_scheduled_tokens,
                 )
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
-            if self.omni_prefix_cache is None:
+            if self.omni_prefix_cache is None and not omit_hidden_pooler_output:
                 mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs))
 
             self._process_additional_information_updates(
@@ -917,6 +1063,50 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 combined_multimodal_outputs,
                 req_ids_filter=downstream_req_id_set,
             )
+
+            inprocess_audio_outputs = {}
+            decode_inprocess_tts = getattr(self.model, "maybe_decode_inprocess_tts_chunks", None)
+            if callable(decode_inprocess_tts):
+                finished_req_ids = set(getattr(scheduler_output, "finished_req_ids", set()) or set())
+                current_finished_req_ids = self._current_step_finished_req_ids(
+                    req_ids_output_copy,
+                    valid_sampled_token_ids,
+                )
+                if current_finished_req_ids:
+                    logger.debug(
+                        "[Qwen3TTS][inprocess_fusion] current_step_finished req_ids=%s",
+                        sorted(current_finished_req_ids),
+                    )
+                    finished_req_ids.update(current_finished_req_ids)
+                info_by_req = {
+                    rid: self.model_intermediate_buffer.get(rid, {})
+                    for rid in downstream_req_ids
+                }
+                inprocess_audio_outputs = decode_inprocess_tts(
+                    downstream_req_ids,
+                    info_by_req,
+                    finished_req_ids,
+                )
+            inprocess_audio_by_req: dict[str, dict[str, object]] = {}
+            for mm_key, values in inprocess_audio_outputs.items():
+                if not isinstance(values, list):
+                    continue
+                for out_pos, rid in enumerate(downstream_req_ids):
+                    if out_pos >= len(values) or values[out_pos] is None:
+                        continue
+                    value = values[out_pos]
+                    if isinstance(value, torch.Tensor):
+                        value = value.detach().to("cpu").contiguous()
+                    inprocess_audio_by_req.setdefault(rid, {})[mm_key] = value
+            if inprocess_audio_by_req:
+                logger.info(
+                    "[Qwen3TTS][inprocess_fusion] runner_output req_ids=%s keys=%s",
+                    sorted(inprocess_audio_by_req.keys()),
+                    {
+                        rid: sorted(payload.keys())
+                        for rid, payload in inprocess_audio_by_req.items()
+                    },
+                )
 
             if req_hidden_states_cpu is not None and combined_hidden_states is None:
                 for rid in downstream_req_ids:
@@ -935,19 +1125,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 start = int(query_start_loc_cpu[idx])
                 sched = int(num_scheduled_tokens_np[idx])
                 end = start + sched
-                # If prefix cache is enabled, we have already split everything
-                # by request and converted the states to CPU tensors
-                if req_hidden_states_cpu is not None and combined_hidden_states is None:
-                    req_hidden_states = req_hidden_states_cpu[rid]
-                else:
-                    req_hidden_states = self._resolve_req_hidden_states(
-                        hidden_states_cpu,
-                        combined_hidden_states,
-                        rid,
-                        start,
-                        end,
-                    )
-                payload: dict[str, object] = {"hidden": req_hidden_states}
+                payload: dict[str, object] = {}
+                if not omit_hidden_pooler_output:
+                    # If prefix cache is enabled, we have already split everything
+                    # by request and converted the states to CPU tensors
+                    if req_hidden_states_cpu is not None and combined_hidden_states is None:
+                        req_hidden_states = req_hidden_states_cpu[rid]
+                    else:
+                        req_hidden_states = self._resolve_req_hidden_states(
+                            hidden_states_cpu,
+                            combined_hidden_states,
+                            rid,
+                            start,
+                            end,
+                        )
+                    payload["hidden"] = req_hidden_states
 
                 mm_payload: dict[str, object] = {}
                 if combined_multimodal_outputs or mm_cpu:
@@ -976,6 +1168,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 seq_len=seq_len,
                             )
                     payload.update(mm_payload)
+                payload.update(inprocess_audio_by_req.get(rid, {}))
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))
