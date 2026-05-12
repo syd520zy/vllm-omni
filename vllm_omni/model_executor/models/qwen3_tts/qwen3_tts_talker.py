@@ -32,7 +32,6 @@ from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.speaker_cache import get_speaker_cache
 
 from .configuration_qwen3_tts import Qwen3TTSConfig, Qwen3TTSSpeakerEncoderConfig, Qwen3TTSTalkerConfig
-from .qwen3_tts_code2wav import Qwen3TTSCode2Wav
 from .qwen3_tts_code_predictor_vllm import Qwen3TTSTalkerCodePredictorForConditionalGenerationVLLM
 from .qwen3_tts_tokenizer import Qwen3TTSTokenizer
 
@@ -337,20 +336,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._codec_eos_token_id = int(getattr(self.talker_config, "codec_eos_token_id", -1))
 
         self._eos_logit_bias: float = 0.0
-        self.tts_inprocess_fusion_enable = bool(
-            getattr(vllm_config.model_config, "tts_inprocess_fusion_enable", False)
-        )
-        self.tts_fusion_chunk_frames = int(getattr(vllm_config.model_config, "tts_fusion_chunk_frames", 100))
-        self.tts_fusion_left_context_frames = int(
-            getattr(vllm_config.model_config, "tts_fusion_left_context_frames", 25)
-        )
-        if self.tts_fusion_chunk_frames <= 0:
-            raise ValueError(f"tts_fusion_chunk_frames must be > 0, got {self.tts_fusion_chunk_frames}")
-        if self.tts_fusion_left_context_frames < 0:
-            raise ValueError(
-                "tts_fusion_left_context_frames must be >= 0, "
-                f"got {self.tts_fusion_left_context_frames}"
-            )
 
         self.have_multimodal_outputs = True
         self.has_preprocess = True
@@ -448,198 +433,8 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker_sampling) if isinstance(raw_subtalker_sampling, Mapping) else {}
         )
-        self.inprocess_code2wav: Qwen3TTSCode2Wav | None = None
-        self.omit_hidden_pooler_output = False
-        if self.tts_inprocess_fusion_enable:
-            self.inprocess_code2wav = Qwen3TTSCode2Wav(
-                vllm_config=vllm_config,
-                prefix=maybe_prefix(prefix, "inprocess_code2wav"),
-            )
-            self.omit_hidden_pooler_output = True
-            logger.info(
-                "[Qwen3TTS][inprocess_fusion] enabled chunk_frames=%d left_context_frames=%d",
-                self.tts_fusion_chunk_frames,
-                self.tts_fusion_left_context_frames,
-            )
 
     # -------------------- vLLM required hooks --------------------
-
-    def _normalize_fusion_codes(
-        self,
-        codes: object,
-        *,
-        device: torch.device,
-        num_quantizers: int,
-    ) -> torch.Tensor | None:
-        if isinstance(codes, list):
-            codes = codes[0] if codes else None
-        if not isinstance(codes, torch.Tensor) or codes.numel() == 0:
-            return None
-        frames = codes.to(device=device, dtype=torch.long)
-        if frames.ndim == 1:
-            if frames.numel() % num_quantizers != 0:
-                logger.warning(
-                    "Ignoring malformed Qwen3-TTS fusion codes with %d elements not divisible by q=%d",
-                    frames.numel(),
-                    num_quantizers,
-                )
-                return None
-            frames = frames.reshape(-1, num_quantizers)
-        elif frames.ndim == 2:
-            if int(frames.shape[-1]) != num_quantizers and int(frames.shape[0]) == num_quantizers:
-                frames = frames.transpose(0, 1).contiguous()
-        else:
-            frames = frames.reshape(-1, frames.shape[-1])
-        if frames.ndim != 2 or int(frames.shape[-1]) != num_quantizers:
-            logger.warning("Ignoring malformed Qwen3-TTS fusion codes with shape %s", tuple(frames.shape))
-            return None
-        valid_mask = frames.any(dim=1) & (frames.min(dim=1).values >= 0)
-        codebook_size = int(self._codebook_vocab_size)
-        if codebook_size > 0:
-            valid_mask &= frames.max(dim=1).values < codebook_size
-        frames = frames[valid_mask]
-        return frames if frames.numel() > 0 else None
-
-    def maybe_decode_inprocess_tts_chunks(
-        self,
-        req_ids: list[str],
-        info_by_req: dict[str, dict[str, Any]],
-        finished_req_ids: set[str],
-    ) -> dict[str, list[torch.Tensor | None]]:
-        """Decode ready Qwen3-TTS codec chunks inside the talker process."""
-        if not self.tts_inprocess_fusion_enable or self.inprocess_code2wav is None:
-            return {}
-
-        device = next(self.parameters()).device
-        q = int(self.talker_config.num_code_groups)
-        sr = torch.tensor(24000, dtype=torch.int32, device=device)
-        audios: list[torch.Tensor | None] = [None for _ in req_ids]
-        srs: list[torch.Tensor | None] = [None for _ in req_ids]
-        emitted_any = False
-
-        for out_idx, req_id in enumerate(req_ids):
-            info = info_by_req.get(req_id)
-            if not isinstance(info, dict):
-                continue
-            codes = info.get("codes", {})
-            if not isinstance(codes, dict):
-                continue
-
-            new_frames = self._normalize_fusion_codes(codes.get("audio"), device=device, num_quantizers=q)
-            if new_frames is not None:
-                existing = info.get("_tts_fusion_all_codes")
-                if isinstance(existing, torch.Tensor) and existing.numel() > 0:
-                    existing = existing.to(device=device, dtype=torch.long)
-                    all_frames = torch.cat([existing, new_frames], dim=0)
-                else:
-                    all_frames = new_frames
-                info["_tts_fusion_all_codes"] = all_frames
-
-            all_codes = info.get("_tts_fusion_all_codes")
-            emitted_frames = int(info.get("_tts_fusion_emitted_frames") or 0)
-            total_frames = int(all_codes.shape[0]) if isinstance(all_codes, torch.Tensor) else 0
-            pending_frames = total_frames - emitted_frames
-            finished = req_id in finished_req_ids
-            if pending_frames <= 0:
-                continue
-            early_decode_margin = 2
-            near_chunk_boundary = pending_frames >= max(1, self.tts_fusion_chunk_frames - early_decode_margin)
-            if pending_frames < self.tts_fusion_chunk_frames and not finished and not near_chunk_boundary:
-                last_logged = int(info.get("_tts_fusion_wait_log_frames") or 0)
-                half = max(1, self.tts_fusion_chunk_frames // 2)
-                should_log_wait = (
-                    pending_frames == half
-                    or pending_frames == (self.tts_fusion_chunk_frames - early_decode_margin - 1)
-                )
-                if should_log_wait and pending_frames != last_logged:
-                    info["_tts_fusion_wait_log_frames"] = pending_frames
-                    logger.info(
-                        "[Qwen3TTS][inprocess_fusion] req_id=%s waiting pending_frames=%d "
-                        "chunk_frames=%d total_frames=%d emitted_frames=%d",
-                        req_id,
-                        pending_frames,
-                        self.tts_fusion_chunk_frames,
-                        total_frames,
-                        emitted_frames,
-                    )
-                continue
-            if not finished and near_chunk_boundary and pending_frames < self.tts_fusion_chunk_frames:
-                logger.info(
-                    "[Qwen3TTS][inprocess_fusion] req_id=%s early_decode pending_frames=%d chunk_frames=%d",
-                    req_id,
-                    pending_frames,
-                    self.tts_fusion_chunk_frames,
-                )
-
-            chunk_end = total_frames
-            if not finished:
-                chunk_end = emitted_frames + self.tts_fusion_chunk_frames
-            chunk_start = max(0, emitted_frames - self.tts_fusion_left_context_frames)
-            chunk = all_codes[chunk_start:chunk_end]
-            left_context = emitted_frames - chunk_start
-
-            ref_code = self._normalize_fusion_codes(codes.get("ref"), device=device, num_quantizers=q)
-            if ref_code is not None and emitted_frames == 0:
-                chunk = torch.cat([ref_code, chunk], dim=0)
-                left_context += int(ref_code.shape[0])
-
-            flat = chunk.transpose(0, 1).contiguous().reshape(-1)
-            runtime_info: dict[str, Any] = {"meta": {"left_context_size": [left_context]}}
-            logger.info(
-                "[Qwen3TTS][inprocess_fusion] req_id=%s decode chunk_start=%d chunk_end=%d "
-                "total_frames=%d pending_frames=%d left_context=%d flat_tokens=%d finished=%s",
-                req_id,
-                chunk_start,
-                chunk_end,
-                total_frames,
-                pending_frames,
-                left_context,
-                int(flat.numel()),
-                finished,
-            )
-            decoded = self.inprocess_code2wav(
-                input_ids=flat,
-                runtime_additional_information=[runtime_info],
-                seq_token_counts=[int(flat.numel())],
-            )
-            mm = decoded.multimodal_outputs or {}
-            model_outputs = mm.get("model_outputs")
-            decoded_srs = mm.get("sr")
-            if isinstance(model_outputs, list) and model_outputs:
-                audio = model_outputs[0]
-                if isinstance(audio, torch.Tensor) and audio.numel() > 0:
-                    audios[out_idx] = audio
-                    if isinstance(decoded_srs, list) and decoded_srs:
-                        srs[out_idx] = decoded_srs[0]
-                    else:
-                        srs[out_idx] = sr
-                    emitted_any = True
-                    logger.info(
-                        "[Qwen3TTS][inprocess_fusion] req_id=%s emitted_audio_samples=%d sr=%s "
-                        "emitted_frames=%d",
-                        req_id,
-                        int(audio.numel()),
-                        int(srs[out_idx].reshape(-1)[0].item()) if isinstance(srs[out_idx], torch.Tensor) else srs[out_idx],
-                        chunk_end,
-                    )
-                else:
-                    logger.info(
-                        "[Qwen3TTS][inprocess_fusion] req_id=%s decoded empty audio for chunk_end=%d",
-                        req_id,
-                        chunk_end,
-                    )
-            info["_tts_fusion_emitted_frames"] = chunk_end
-            if finished:
-                logger.info(
-                    "[Qwen3TTS][inprocess_fusion] req_id=%s finished cleanup total_frames=%d",
-                    req_id,
-                    total_frames,
-                )
-                info.pop("_tts_fusion_all_codes", None)
-
-        if not emitted_any:
-            return {}
-        return {"model_outputs": audios, "sr": srs}
 
     def embed_input_ids(self, input_ids: torch.Tensor, **_: Any) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
@@ -1870,9 +1665,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             # Some checkpoints do not include speaker_encoder weights; keep the
             # eagerly initialized module and satisfy the strict loader check.
             loaded |= {name for name, _ in self.named_parameters() if name.startswith("speaker_encoder.")}
-        if self.inprocess_code2wav is not None:
-            code2wav_loaded = self.inprocess_code2wav.load_weights(iter(()))
-            loaded |= {f"inprocess_code2wav.{name}" for name in code2wav_loaded}
         logger.info("Loaded %d weights for Qwen3TTSTalkerForConditionalGeneration", len(loaded))
         return loaded
 

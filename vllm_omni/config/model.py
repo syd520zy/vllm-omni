@@ -137,9 +137,6 @@ class OmniModelConfig(ModelConfig):
     task_type: str | None = None
     enable_sleep_mode: bool = False
     has_sampling_extra_args: bool = False
-    tts_inprocess_fusion_enable: bool = False
-    tts_fusion_chunk_frames: int = 100
-    tts_fusion_left_context_frames: int = 25
 
     @property
     def registry(self):
