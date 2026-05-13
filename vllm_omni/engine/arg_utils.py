@@ -146,6 +146,10 @@ class OmniEngineArgs(EngineArgs):
     worker_cls: str = None
     enable_sleep_mode: bool = False
     omni: bool = False
+    tts_inprocess_fusion_enable: bool = False
+    tts_fusion_chunk_frames: int = 100
+    tts_fusion_initial_chunk_frames: int = 25
+    tts_fusion_left_context_frames: int = 25
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -343,6 +347,10 @@ class OmniEngineArgs(EngineArgs):
             omni_kv_config=self.omni_kv_config,
             task_type=self.task_type,
             has_sampling_extra_args=self.has_sampling_extra_args,
+            tts_inprocess_fusion_enable=self.tts_inprocess_fusion_enable,
+            tts_fusion_chunk_frames=self.tts_fusion_chunk_frames,
+            tts_fusion_initial_chunk_frames=self.tts_fusion_initial_chunk_frames,
+            tts_fusion_left_context_frames=self.tts_fusion_left_context_frames,
         )
         return omni_config
 

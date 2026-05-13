@@ -49,6 +49,10 @@ _OMNI_PIPELINES: dict[str, tuple[str, str]] = {
         "vllm_omni.model_executor.models.qwen3_tts.pipeline",
         "QWEN3_TTS_PIPELINE",
     ),
+    "qwen3_tts_inprocess": (
+        "vllm_omni.model_executor.models.qwen3_tts.pipeline",
+        "QWEN3_TTS_INPROCESS_PIPELINE",
+    ),
     "bagel": (
         "vllm_omni.model_executor.models.bagel.pipeline",
         "BAGEL_PIPELINE",

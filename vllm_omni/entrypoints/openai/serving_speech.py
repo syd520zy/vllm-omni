@@ -30,6 +30,7 @@ from vllm.multimodal.media import MediaConnector
 from vllm.utils import random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.v1.engine.exceptions import EngineDeadError, EngineGenerateError
+from vllm.sampling_params import RequestOutputKind
 
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
@@ -98,6 +99,21 @@ _REF_AUDIO_MAX_DURATION = 30.0  # seconds
 _TTS_MAX_INSTRUCTIONS_LENGTH = 500
 _TTS_MAX_NEW_TOKENS_MIN = 1
 _TTS_MAX_NEW_TOKENS_MAX = 4096
+
+
+def _audio_has_non_empty_tensor(audio_tensor: Any) -> bool:
+    if isinstance(audio_tensor, list):
+        return any(hasattr(c, "numel") and c.numel() > 0 for c in audio_tensor)
+    return hasattr(audio_tensor, "numel") and audio_tensor.numel() > 0
+
+
+def _audio_debug_shape(audio_tensor: Any) -> Any:
+    if isinstance(audio_tensor, list):
+        return [
+            tuple(c.shape) if hasattr(c, "shape") else type(c).__name__
+            for c in audio_tensor
+        ]
+    return tuple(audio_tensor.shape) if hasattr(audio_tensor, "shape") else type(audio_tensor).__name__
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
@@ -1531,6 +1547,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         prev_count = 0
         sample_rate_val = 24000
         first_chunk = True
+        emitted_any_chunk = False
+        last_non_empty_chunk_np = None
+        last_non_empty_sr = None
 
         try:
             async for res in generator:
@@ -1548,6 +1567,17 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     # Cumulative mode: each update grows the list; emit only new tail.
                     new_chunks = audio_val[prev_count:]
                     prev_count = len(audio_val)
+                    # Some outputs update audio in-place without growing list length.
+                    # Keep a snapshot of the latest non-empty chunk for end-of-stream fallback.
+                    non_empty = [c for c in audio_val if hasattr(c, "numel") and c.numel() > 0]
+                    if non_empty:
+                        cand = non_empty[-1]
+                        chunk_np = cand.float().detach().cpu().numpy() if hasattr(cand, "float") else cand
+                        if chunk_np.ndim > 1:
+                            chunk_np = chunk_np.squeeze()
+                        if chunk_np.size > 0:
+                            last_non_empty_chunk_np = chunk_np
+                            last_non_empty_sr = sample_rate_val
                 else:
                     # Per-step mode: each update is a single tensor; emit directly.
                     if audio_val is not None:
@@ -1562,6 +1592,10 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     )
                     if chunk_np.ndim > 1:
                         chunk_np = chunk_np.squeeze()
+                    if chunk_np.size == 0:
+                        continue
+                    last_non_empty_chunk_np = chunk_np
+                    last_non_empty_sr = sample_rate_val
                     # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
                         # Assert that sample rate has been set from chunk metadata (not just default)
@@ -1582,7 +1616,35 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         stream_format="audio",
                         base64_encode=False,
                     )
+                    emitted_any_chunk = True
                     yield self.create_audio(audio_obj).audio_data
+
+            # Fallback: no chunks were emitted during streaming loop, but a final
+            # non-empty audio snapshot exists (e.g. in-place list update with
+            # unchanged list length). Emit it once so stream clients (benchmark)
+            # get non-zero PCM payload.
+            if not emitted_any_chunk and last_non_empty_chunk_np is not None and last_non_empty_chunk_np.size > 0:
+                if response_format == "wav" and first_chunk:
+                    wav_header = _create_wav_header(
+                        sample_rate=last_non_empty_sr or sample_rate_val,
+                        num_channels=1,
+                        bits_per_sample=16,
+                    )
+                    yield wav_header
+                audio_obj = CreateAudio(
+                    audio_tensor=last_non_empty_chunk_np,
+                    sample_rate=last_non_empty_sr or sample_rate_val,
+                    response_format="pcm",
+                    speed=1.0,
+                    stream_format="audio",
+                    base64_encode=False,
+                )
+                logger.info(
+                    "Streaming fallback emitted final audio chunk for request %s (samples=%d)",
+                    request_id,
+                    int(last_non_empty_chunk_np.shape[-1]) if hasattr(last_non_empty_chunk_np, "shape") else -1,
+                )
+                yield self.create_audio(audio_obj).audio_data
         except asyncio.CancelledError:
             logger.info("Streaming request %s cancelled by client", request_id)
             raise
@@ -1652,6 +1714,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         # Text content (always required)
         params["text"] = [request.input]
+        # Qwen3-TTS in-process fusion emits audio chunks from the AR stage.
+        # Even for non-streaming HTTP requests we want internal chunk outputs
+        # so _generate_audio_bytes() can concatenate them into one final wav.
+        params["openai_stream"] = [bool(request.stream or self._tts_model_type == "qwen3_tts")]
+        params["qwen3_tts_http_stream"] = [bool(request.stream)]
 
         # Task type
         if request.task_type is not None:
@@ -1974,7 +2041,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # we don't emit redundant MM data & drain after emitting.
         # list() makes a copy to avoid mutating the params.
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
-        sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+        use_delta_outputs = request.stream or self._tts_model_type == "qwen3_tts"
+        sampling_params_list = coerce_param_message_types(sampling_params_list, use_delta_outputs)
+        if self._tts_model_type == "qwen3_tts":
+            for idx, sp in enumerate(sampling_params_list):
+                if not getattr(sp, "skip_clone", False):
+                    sp = sp.clone()
+                    sp.skip_clone = True
+                    sampling_params_list[idx] = sp
+                sp.output_kind = RequestOutputKind.DELTA
+            logger.info(
+                "Qwen3-TTS speech request uses internal DELTA output_kind for %d sampling params",
+                len(sampling_params_list),
+            )
 
         # Resolve uploaded voice for non-Qwen3 models.
         # Qwen3 TTS has its own uploaded voice handling in _build_tts_params().
@@ -2211,15 +2290,28 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         is_moss = self._tts_model_type == "moss_tts_nano"
         moss_chunks: list[Any] = []
         moss_sample_rate: int | None = None
+        model_cfg = getattr(self.engine_client, "model_config", None)
+        is_qwen3_tts_inprocess = self._tts_model_type == "qwen3_tts"
+        qwen3_tts_inprocess_chunks: list[Any] = []
+        qwen3_tts_inprocess_sample_rate: int | None = None
 
         final_output: OmniRequestOutput | None = None
+        last_non_empty_audio_output: dict[str, Any] | None = None
+        last_non_empty_audio_key: str | None = None
+        observed_audio_keys: list[tuple[str, Any]] = []
         async for res in generator:
             final_output = res
-            if not is_moss:
-                continue
             try:
                 step_audio, step_key = self._extract_audio_output(res)
             except Exception:
+                step_audio, step_key = {}, None
+            if step_key is not None:
+                step_tensor = step_audio.get(step_key)
+                observed_audio_keys.append((step_key, _audio_debug_shape(step_tensor)))
+                if _audio_has_non_empty_tensor(step_tensor):
+                    last_non_empty_audio_output = step_audio
+                    last_non_empty_audio_key = step_key
+            if not (is_moss or is_qwen3_tts_inprocess):
                 continue
             if step_key is None:
                 continue
@@ -2227,20 +2319,42 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             candidates = chunk if isinstance(chunk, list) else [chunk]
             for cand in candidates:
                 if hasattr(cand, "numel") and cand.numel() > 0:
-                    moss_chunks.append(cand)
+                    if is_moss:
+                        moss_chunks.append(cand)
+                    if is_qwen3_tts_inprocess:
+                        qwen3_tts_inprocess_chunks.append(cand)
             sr_step = step_audio.get("sr")
             if sr_step is not None:
                 sr_val_step = sr_step[-1] if isinstance(sr_step, list) and sr_step else sr_step
-                moss_sample_rate = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
+                sample_rate_step = int(sr_val_step.item()) if hasattr(sr_val_step, "item") else int(sr_val_step)
+                if is_moss:
+                    moss_sample_rate = sample_rate_step
+                if is_qwen3_tts_inprocess:
+                    qwen3_tts_inprocess_sample_rate = sample_rate_step
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
 
         audio_output, audio_key = self._extract_audio_output(final_output)
+        if audio_key is None and last_non_empty_audio_key is not None and last_non_empty_audio_output is not None:
+            audio_output, audio_key = last_non_empty_audio_output, last_non_empty_audio_key
         if audio_key is None:
+            logger.warning(
+                "TTS request %s produced no audio output; observed_audio_keys=%s final_output_type=%s",
+                request_id,
+                observed_audio_keys[-8:],
+                type(final_output).__name__,
+            )
             raise ValueError("TTS model did not produce audio output.")
 
         audio_tensor = audio_output[audio_key]
+        if (
+            last_non_empty_audio_key is not None
+            and last_non_empty_audio_output is not None
+            and not _audio_has_non_empty_tensor(audio_tensor)
+        ):
+            audio_output, audio_key = last_non_empty_audio_output, last_non_empty_audio_key
+            audio_tensor = audio_output[audio_key]
         sr_raw = audio_output.get("sr", 24000)
         sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
         sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
@@ -2267,6 +2381,23 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_tensor = np.zeros((0,), dtype=np.float32)
             if moss_sample_rate is not None:
                 sample_rate = moss_sample_rate
+        elif is_qwen3_tts_inprocess and qwen3_tts_inprocess_chunks:
+            # In-process Qwen3-TTS emits delta audio chunks from the AR stage.
+            # The final RequestOutput may only carry the last non-empty chunk,
+            # so concatenate all chunks observed across the generator loop.
+            logger.info(
+                "Qwen3-TTS inprocess speech request %s collected %d audio chunks, samples=%s",
+                request_id,
+                len(qwen3_tts_inprocess_chunks),
+                [
+                    int(chunk.numel())
+                    for chunk in qwen3_tts_inprocess_chunks[-16:]
+                    if hasattr(chunk, "numel")
+                ],
+            )
+            audio_tensor = torch.cat([chunk.reshape(-1) for chunk in qwen3_tts_inprocess_chunks], dim=-1)
+            if qwen3_tts_inprocess_sample_rate is not None:
+                sample_rate = qwen3_tts_inprocess_sample_rate
         elif isinstance(audio_tensor, list):
             async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
             if async_chunk:
@@ -2287,6 +2418,16 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         if audio_tensor.ndim > 1:
             audio_tensor = audio_tensor.squeeze()
+        if self._tts_model_type == "qwen3_tts":
+            logger.info(
+                "Qwen3-TTS speech request %s final audio samples=%d sample_rate=%s observed_audio_keys=%s",
+                request_id,
+                int(audio_tensor.size),
+                sample_rate,
+                observed_audio_keys[-16:],
+            )
+        if audio_tensor.size == 0:
+            raise ValueError("TTS model produced empty audio output.")
 
         audio_obj = CreateAudio(
             audio_tensor=audio_tensor,
@@ -2378,6 +2519,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 audio_tensor = audio_tensor.float().detach().cpu().numpy()
             if audio_tensor.ndim > 1:
                 audio_tensor = audio_tensor.squeeze()
+            if audio_tensor.size == 0:
+                raise ValueError("TTS model produced empty audio output.")
 
             audio_obj = CreateAudio(
                 audio_tensor=audio_tensor,

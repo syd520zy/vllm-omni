@@ -582,13 +582,43 @@ async def async_request_openai_audio_speech(
                 if pcm_capture is not None and pcm_capture:
                     output.tts_output_pcm_bytes = bytes(pcm_capture)
                 elif capture_wer_pcm:
-                    ct = response.headers.get("Content-Type", "")
+                        ct = response.headers.get("Content-Type", "")
+                        logger.warning(
+                            "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
+                            "Check stream=true and response_format=pcm on the server.",
+                            ct,
+                            api_url,
+                        )
+                # Some server paths may acknowledge streaming (HTTP 200) but
+                # emit no PCM chunks. Fallback once to non-stream wav so
+                # benchmark can still measure audio duration/RTF.
+                if output.audio_frames == 0:
+                    fallback_payload = dict(payload)
+                    fallback_payload["stream"] = False
+                    fallback_payload["response_format"] = "wav"
                     logger.warning(
-                        "Seed-TTS WER: HTTP 200 but no PCM bytes (Content-Type=%r, url=%s). "
-                        "Check stream=true and response_format=pcm on the server.",
-                        ct,
+                        "Streaming returned zero PCM bytes for %s; fallback to non-stream wav for metrics",
                         api_url,
                     )
+                    try:
+                        async with session.post(url=api_url, json=fallback_payload, headers=headers) as resp2:
+                            if resp2.status == 200:
+                                wav_bytes = await resp2.read()
+                                if wav_bytes:
+                                    seg = AudioSegment.from_file(io.BytesIO(wav_bytes))
+                                    output.audio_duration = len(seg) / 1000.0
+                                    frame_width = seg.frame_width
+                                    output.audio_frames = len(seg.raw_data) // frame_width if frame_width > 0 else 0
+                                    if output.audio_duration > 0:
+                                        output.audio_rtf = output.latency / output.audio_duration
+                                    if capture_wer_pcm:
+                                        try:
+                                            pcm_seg = seg.set_frame_rate(24000).set_channels(1).set_sample_width(2)
+                                            output.tts_output_pcm_bytes = bytes(pcm_seg.raw_data)
+                                        except Exception as ex:
+                                            logger.warning("seed_tts WER fallback PCM export failed: %s", ex)
+                    except Exception as ex:
+                        logger.warning("non-stream fallback failed: %s", ex)
                 output.success = True
             else:
                 output.error = response.reason or ""

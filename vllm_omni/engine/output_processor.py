@@ -42,6 +42,7 @@ class OmniRequestState(RequestState):
         # outputs are drained (i.e., only drain modality keys, don't drain
         # hidden states).
         self.mm_accumulated: dict[str, Any] = {}
+        self._has_new_drainable_mm_output = False
 
     @staticmethod
     def _to_cpu(x):
@@ -81,6 +82,9 @@ class OmniRequestState(RequestState):
             else:
                 key = mm_type or "hidden"
                 incoming = {key: self._to_cpu(payload)}
+
+            if any(str(k) in {str(m) for m in DRAINABLE_MODALITIES} for k in incoming):
+                self._has_new_drainable_mm_output = True
 
             if not self.mm_accumulated:
                 self.mm_accumulated = incoming
@@ -215,10 +219,12 @@ class OmniRequestState(RequestState):
             # Send output request only when
             # 1. It has finished, or
             # 2. It is the first token, or
-            # 3. It has reached the stream interval number of tokens
+            # 3. It has reached the stream interval number of tokens, or
+            # 4. it carries a new drainable multimodal payload such as audio.
             if not (
                 finished
                 or self.sent_tokens_offset == 0
+                or self._has_new_drainable_mm_output
                 or self.detokenizer.num_output_tokens() - self.sent_tokens_offset >= self.stream_interval
             ):
                 return None
@@ -270,6 +276,7 @@ class OmniRequestState(RequestState):
         if self.output_kind == RequestOutputKind.DELTA:
             for modality_key in DRAINABLE_MODALITIES:
                 self.mm_accumulated.pop(modality_key, None)
+        self._has_new_drainable_mm_output = False
 
         return base_output
 
@@ -383,18 +390,51 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_timestamp: float | None = None,
         iteration_stats: IterationStats | None = None,
     ) -> OutputProcessorOutput:
+        force_mm_output_req_ids: set[str] = set()
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
                 continue
             if eco.pooling_output is not None and req_state.detokenizer is not None:
                 mm_type = (getattr(eco, "output_type", self.engine_core_output_type) or "").lower()
+                if mm_type in DRAINABLE_MODALITIES or (
+                    isinstance(eco.pooling_output, dict)
+                    and any(k in eco.pooling_output for k in ("model_outputs", "audio"))
+                ):
+                    force_mm_output_req_ids.add(eco.request_id)
                 req_state.add_multimodal_tensor(eco.pooling_output, mm_type)
                 # Force text path in base processor for multimodal outputs.
                 eco.pooling_output = None
 
-        return super().process_outputs(
+        processor_output = super().process_outputs(
             engine_core_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
+        if force_mm_output_req_ids:
+            request_outputs = getattr(processor_output, "request_outputs", None)
+            if isinstance(request_outputs, list):
+                emitted_req_ids = {getattr(output, "request_id", None) for output in request_outputs}
+                extra_outputs = []
+                for req_id in sorted(force_mm_output_req_ids):
+                    if req_id in emitted_req_ids:
+                        continue
+                    req_state = self.request_states.get(req_id)
+                    if not isinstance(req_state, OmniRequestState) or not req_state.mm_accumulated:
+                        continue
+                    output = req_state.make_request_output([], None, None, None)
+                    if output is not None:
+                        extra_outputs.append(output)
+                if extra_outputs:
+                    logger.info(
+                        "Emitting %d multimodal-only RequestOutput(s) for req_ids=%s",
+                        len(extra_outputs),
+                        [getattr(output, "request_id", None) for output in extra_outputs],
+                    )
+                    request_outputs.extend(extra_outputs)
+            else:
+                logger.debug(
+                    "Cannot append multimodal-only outputs; unexpected OutputProcessorOutput shape: %s",
+                    type(processor_output).__name__,
+                )
+        return processor_output
