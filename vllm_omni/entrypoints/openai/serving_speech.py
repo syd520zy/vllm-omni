@@ -2209,6 +2209,47 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
 
+    async def _generate_audio_sse_events(
+        self,
+        generator,
+        request_id: str,
+        response_format: str = "pcm",
+        raw_request: Request | None = None,
+        request_start_s: float | None = None,
+    ):
+        """Generate OpenAI-style SSE events with base64 audio deltas."""
+        try:
+            async for chunk in self._generate_audio_chunks(
+                generator,
+                request_id,
+                response_format,
+                raw_request=raw_request,
+                request_start_s=request_start_s,
+            ):
+                payload = {
+                    "type": "speech.audio.delta",
+                    "delta": base64.b64encode(chunk).decode("ascii"),
+                    "response_format": response_format,
+                }
+                data = json.dumps(payload, separators=(",", ":"))
+                yield f"event: speech.audio.delta\ndata: {data}\n\n"
+            done = json.dumps({"type": "speech.audio.done"}, separators=(",", ":"))
+            yield f"event: speech.audio.done\ndata: {done}\n\n"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            payload = {
+                "type": "speech.audio.error",
+                "error": {
+                    "message": str(e),
+                    "type": "server_error",
+                    "param": None,
+                    "code": HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                },
+            }
+            data = json.dumps(payload, separators=(",", ":"))
+            yield f"event: speech.audio.error\ndata: {data}\n\n"
+
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
         """Return (audio_output dict, audio key) or (None, None).
@@ -3354,7 +3395,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         try:
-            if request.stream:
+            if request.stream or request.stream_format == "sse":
                 # Determine response format and media type for streaming
                 response_format = (request.response_format or "wav").lower()
 
@@ -3372,8 +3413,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         "Use stream=False or remove the speed parameter."
                     )
 
-                media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                if request.stream_format == "sse":
+                    return StreamingResponse(
+                        self._generate_audio_sse_events(
+                            generator,
+                            request_id,
+                            response_format,
+                            raw_request=raw_request,
+                            request_start_s=request_start_s,
+                        ),
+                        media_type="text/event-stream",
+                    )
+
+                media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 return StreamingResponse(
                     self._generate_audio_chunks(
                         generator,
