@@ -468,6 +468,10 @@
       return merged.slice(0, alignedLength);
     }
 
+    function yieldToPlayback() {
+      return new Promise((resolve) => setTimeout(resolve, 0));
+    }
+
     function pcm16ToAudioBuffer(bytes) {
       const { samples, frameCount } = pcm16ToInterleavedFloat32(bytes);
       const buffer = audioContext.createBuffer(channels, frameCount, pcmSampleRate);
@@ -844,6 +848,7 @@
           break;
         }
         await handleRawAudioChunk(value);
+        await yieldToPlayback();
       }
       if (pcmRemainderBuffer.length) {
         log(`Dropped ${pcmRemainderBuffer.length} trailing unaligned PCM byte(s).`);
