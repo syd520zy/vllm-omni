@@ -96,7 +96,7 @@
 
     .row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) 150px;
+      grid-template-columns: minmax(0, 1fr) 150px 150px;
       gap: 12px;
       margin-bottom: 14px;
     }
@@ -236,6 +236,10 @@
             <label for="sampleRate">PCM Sample Rate</label>
             <input id="sampleRate" type="number" min="8000" step="1000" value="24000">
           </div>
+          <div>
+            <label for="prebuffer">Prebuffer Seconds</label>
+            <input id="prebuffer" type="number" min="0" step="0.05" value="0.35">
+          </div>
         </div>
 
         <div class="field">
@@ -268,7 +272,7 @@
             <span id="byteCount" class="value">0</span>
           </div>
           <div class="metric">
-            <label>Queued</label>
+            <label>Buffered</label>
             <span id="queuedTime" class="value">0.00s</span>
           </div>
           <div class="metric">
@@ -284,6 +288,7 @@
   <script>
     const urlInput = document.getElementById("url");
     const sampleRateInput = document.getElementById("sampleRate");
+    const prebufferInput = document.getElementById("prebuffer");
     const payloadInput = document.getElementById("payload");
     const sendButton = document.getElementById("send");
     const stopButton = document.getElementById("stop");
@@ -297,7 +302,11 @@
 
     let abortController = null;
     let audioContext = null;
-    let nextPlayTime = 0;
+    let audioWorkletNode = null;
+    let audioWorkletReady = false;
+    let playbackStarted = false;
+    let bufferedSamples = 0;
+    let fallbackNextPlayTime = 0;
     let chunkCount = 0;
     let byteCount = 0;
     let currentFormat = "pcm";
@@ -322,7 +331,12 @@
       currentFormat = format || "pcm";
       wavHeaderParsed = false;
       channels = 1;
-      nextPlayTime = 0;
+      playbackStarted = false;
+      bufferedSamples = 0;
+      fallbackNextPlayTime = 0;
+      if (audioWorkletNode) {
+        audioWorkletNode.port.postMessage({ type: "reset", channels });
+      }
       chunkCountEl.textContent = "0";
       byteCountEl.textContent = "0";
       queuedTimeEl.textContent = "0.00s";
@@ -334,10 +348,15 @@
       byteCount += bytes;
       chunkCountEl.textContent = String(chunkCount);
       byteCountEl.textContent = String(byteCount);
-      if (audioContext) {
-        const queued = Math.max(0, nextPlayTime - audioContext.currentTime);
-        queuedTimeEl.textContent = `${queued.toFixed(2)}s`;
+      updateBufferedMetric();
+    }
+
+    function updateBufferedMetric() {
+      let bufferedSeconds = bufferedSamples / pcmSampleRate;
+      if (!audioWorkletNode && audioContext) {
+        bufferedSeconds = Math.max(0, fallbackNextPlayTime - audioContext.currentTime);
       }
+      queuedTimeEl.textContent = `${bufferedSeconds.toFixed(2)}s`;
     }
 
     function base64ToUint8Array(base64) {
@@ -369,31 +388,146 @@
       log(`WAV header parsed: ${pcmSampleRate} Hz, ${channels} channel(s), ${bitsPerSample}-bit`);
     }
 
-    function pcm16ToAudioBuffer(bytes) {
+    function pcm16ToInterleavedFloat32(bytes) {
       const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
       const frameCount = Math.floor(bytes.byteLength / 2 / channels);
-      const buffer = audioContext.createBuffer(channels, frameCount, pcmSampleRate);
+      const samples = new Float32Array(frameCount * channels);
 
-      for (let ch = 0; ch < channels; ch += 1) {
-        const channelData = buffer.getChannelData(ch);
-        for (let frame = 0; frame < frameCount; frame += 1) {
+      for (let frame = 0; frame < frameCount; frame += 1) {
+        for (let ch = 0; ch < channels; ch += 1) {
           const sampleIndex = (frame * channels + ch) * 2;
-          channelData[frame] = view.getInt16(sampleIndex, true) / 32768;
+          samples[frame * channels + ch] = view.getInt16(sampleIndex, true) / 32768;
         }
       }
 
+      return { samples, frameCount };
+    }
+
+    function pcm16ToAudioBuffer(bytes) {
+      const { samples, frameCount } = pcm16ToInterleavedFloat32(bytes);
+      const buffer = audioContext.createBuffer(channels, frameCount, pcmSampleRate);
+      for (let ch = 0; ch < channels; ch += 1) {
+        const channelData = buffer.getChannelData(ch);
+        for (let frame = 0; frame < frameCount; frame += 1) {
+          channelData[frame] = samples[frame * channels + ch];
+        }
+      }
       return buffer;
+    }
+
+    async function ensureAudioWorklet() {
+      if (!audioContext.audioWorklet || audioWorkletReady) {
+        return;
+      }
+
+      const processorSource = `
+        class PcmQueueProcessor extends AudioWorkletProcessor {
+          constructor() {
+            super();
+            this.queue = [];
+            this.channels = 1;
+            this.started = false;
+            this.queuedFrames = 0;
+            this.ticks = 0;
+            this.port.onmessage = (event) => {
+              const message = event.data || {};
+              if (message.type === "reset") {
+                this.queue = [];
+                this.channels = message.channels || 1;
+                this.started = false;
+                this.queuedFrames = 0;
+                this.port.postMessage({ type: "buffered", frames: this.queuedFrames });
+              } else if (message.type === "start") {
+                this.started = true;
+              } else if (message.type === "chunk") {
+                this.channels = message.channels || this.channels;
+                this.queue.push({
+                  samples: message.samples,
+                  frames: message.frames,
+                  offset: 0,
+                });
+                this.queuedFrames += message.frames;
+                this.port.postMessage({ type: "buffered", frames: this.queuedFrames });
+              }
+            };
+          }
+
+          process(_inputs, outputs) {
+            const output = outputs[0];
+            const frames = output[0]?.length || 0;
+            for (let frame = 0; frame < frames; frame += 1) {
+              if (!this.started || this.queue.length === 0) {
+                for (let ch = 0; ch < output.length; ch += 1) {
+                  output[ch][frame] = 0;
+                }
+                continue;
+              }
+
+              const current = this.queue[0];
+              for (let ch = 0; ch < output.length; ch += 1) {
+                const sourceCh = Math.min(ch, this.channels - 1);
+                output[ch][frame] = current.samples[current.offset * this.channels + sourceCh] || 0;
+              }
+
+              current.offset += 1;
+              this.queuedFrames -= 1;
+              if (current.offset >= current.frames) {
+                this.queue.shift();
+              }
+            }
+
+            this.ticks += 1;
+            if (this.ticks % 16 === 0) {
+              this.port.postMessage({ type: "buffered", frames: Math.max(0, this.queuedFrames) });
+            }
+            return true;
+          }
+        }
+        registerProcessor("pcm-queue-processor", PcmQueueProcessor);
+      `;
+
+      const blob = new Blob([processorSource], { type: "application/javascript" });
+      const url = URL.createObjectURL(blob);
+      try {
+        await audioContext.audioWorklet.addModule(url);
+        audioWorkletNode = new AudioWorkletNode(audioContext, "pcm-queue-processor", {
+          numberOfInputs: 0,
+          numberOfOutputs: 1,
+          outputChannelCount: [channels],
+        });
+        audioWorkletNode.port.onmessage = (event) => {
+          if (event.data?.type === "buffered") {
+            bufferedSamples = event.data.frames;
+            updateBufferedMetric();
+          }
+        };
+        audioWorkletNode.connect(audioContext.destination);
+        audioWorkletNode.port.postMessage({ type: "reset", channels });
+        audioWorkletReady = true;
+        log("AudioWorklet playback enabled.");
+      } finally {
+        URL.revokeObjectURL(url);
+      }
     }
 
     async function ensureAudioContext() {
       if (!audioContext || audioContext.state === "closed") {
         audioContext = new AudioContext({ sampleRate: pcmSampleRate });
+        audioWorkletNode = null;
+        audioWorkletReady = false;
       }
       if (audioContext.state === "suspended") {
         await audioContext.resume();
       }
-      if (nextPlayTime < audioContext.currentTime) {
-        nextPlayTime = audioContext.currentTime + 0.04;
+      try {
+        await ensureAudioWorklet();
+      } catch (error) {
+        audioWorkletNode = null;
+        audioWorkletReady = false;
+        log(`AudioWorklet unavailable, using BufferSource fallback: ${error.message}`);
+      }
+      if (!audioWorkletNode && fallbackNextPlayTime < audioContext.currentTime) {
+        fallbackNextPlayTime = audioContext.currentTime + 0.2;
       }
     }
 
@@ -402,12 +536,36 @@
         return;
       }
       await ensureAudioContext();
+      if (audioWorkletNode) {
+        const { samples, frameCount } = pcm16ToInterleavedFloat32(bytes);
+        audioWorkletNode.port.postMessage(
+          {
+            type: "chunk",
+            samples,
+            frames: frameCount,
+            channels,
+          },
+          [samples.buffer]
+        );
+        bufferedSamples += frameCount;
+        updateStats(bytes.byteLength);
+
+        const prebufferSeconds = Math.max(0, Number(prebufferInput.value) || 0);
+        const prebufferFrames = Math.floor(prebufferSeconds * pcmSampleRate);
+        if (!playbackStarted && bufferedSamples >= prebufferFrames) {
+          audioWorkletNode.port.postMessage({ type: "start" });
+          playbackStarted = true;
+          log(`Playback started after ${(bufferedSamples / pcmSampleRate).toFixed(2)}s buffered.`);
+        }
+        return;
+      }
+
       const buffer = pcm16ToAudioBuffer(bytes);
       const source = audioContext.createBufferSource();
       source.buffer = buffer;
       source.connect(audioContext.destination);
-      source.start(nextPlayTime);
-      nextPlayTime += buffer.duration;
+      source.start(fallbackNextPlayTime);
+      fallbackNextPlayTime += buffer.duration;
       updateStats(bytes.byteLength);
     }
 
@@ -472,18 +630,24 @@
     }
 
     async function handleSseEvent({ event, data }) {
-      log(`${event}: ${data}`);
       if (!data || data === "[DONE]") {
+        log(`${event}: ${data || ""}`);
         return;
       }
 
       const payload = JSON.parse(data);
       if (event === "speech.audio.delta" || payload.type === "speech.audio.delta") {
+        const deltaBytes = payload.delta ? Math.floor((payload.delta.length * 3) / 4) : 0;
+        log(`${event}: ${deltaBytes} base64-decoded byte(s), format=${payload.response_format || currentFormat}`);
         await handleAudioDelta(payload);
       } else if (event === "speech.audio.done" || payload.type === "speech.audio.done") {
+        log(`${event}: done`);
         setStatus("Done", "ok");
       } else if (event === "speech.audio.error" || payload.type === "speech.audio.error") {
+        log(`${event}: ${data}`);
         throw new Error(payload.error?.message || "Server returned speech.audio.error");
+      } else {
+        log(`${event}: ${data}`);
       }
     }
 
