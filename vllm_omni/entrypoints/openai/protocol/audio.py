@@ -89,8 +89,6 @@ class OpenAICreateSpeechRequest(BaseModel):
     @field_validator("stream_format")
     @classmethod
     def validate_stream_format(cls, v: str) -> str:
-        if v == "sse":
-            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
         return v
 
     @field_validator("speaker_embedding")

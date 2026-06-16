@@ -1737,10 +1737,10 @@ class TestStreamingProtocolValidation:
         req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
         assert req.stream is True
 
-    def test_sse_stream_format_is_blocked(self):
-        """stream_format='sse' is blocked."""
-        with pytest.raises(ValidationError, match="sse"):
-            OpenAICreateSpeechRequest(input="Hello", stream_format="sse")
+    def test_sse_stream_format_is_accepted(self):
+        """stream_format='sse' is accepted for OpenAI-compatible event streaming."""
+        req = OpenAICreateSpeechRequest(input="Hello", stream_format="sse")
+        assert req.stream_format == "sse"
 
 
 class TestStreamingResponse:
@@ -1820,6 +1820,33 @@ class TestStreamingResponse:
         assert response.status_code == 200
         assert "audio/pcm" in response.headers["content-type"]
         assert len(response.content) > 0
+
+    def test_sse_streaming(self, streaming_app):
+        """stream_format=sse must return OpenAI-style base64 audio delta events."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
+        )
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+
+        events = [event for event in response.text.strip().split("\n\n") if event]
+        assert len(events) >= 2
+        assert events[-1] == 'event: speech.audio.done\ndata: {"type":"speech.audio.done"}'
+
+        delta_payloads = []
+        for event in events[:-1]:
+            lines = event.splitlines()
+            assert lines[0] == "event: speech.audio.delta"
+            assert lines[1].startswith("data: ")
+            delta_payloads.append(json.loads(lines[1][len("data: ") :]))
+
+        assert delta_payloads
+        for payload in delta_payloads:
+            assert payload["type"] == "speech.audio.delta"
+            assert payload["response_format"] == "pcm"
+            assert base64.b64decode(payload["delta"])
 
     def test_non_streaming_unchanged(self, streaming_app):
         """Non-streaming path must still return audio/wav."""

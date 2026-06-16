@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Audio SSE Player</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --text: #20242c;
+      --muted: #606a78;
+      --line: #d9dee7;
+      --accent: #146ef5;
+      --accent-strong: #0f56bf;
+      --danger: #b3261e;
+      --ok: #0f7b45;
+      --code: #111827;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    main {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 24px auto;
+    }
+
+    h1 {
+      margin: 0 0 18px;
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 360px;
+      gap: 16px;
+      align-items: start;
+    }
+
+    section,
+    aside {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+    }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      text-transform: uppercase;
+    }
+
+    input,
+    textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px 11px;
+      color: var(--text);
+      background: #fff;
+      font: inherit;
+      outline: none;
+    }
+
+    input:focus,
+    textarea:focus {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px rgba(20, 110, 245, 0.12);
+    }
+
+    textarea {
+      min-height: 236px;
+      resize: vertical;
+      font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 13px;
+      line-height: 1.45;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 150px;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .field {
+      margin-bottom: 14px;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-top: 14px;
+    }
+
+    button {
+      min-height: 38px;
+      border: 1px solid transparent;
+      border-radius: 6px;
+      padding: 0 14px;
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button.primary {
+      color: #fff;
+      background: var(--accent);
+    }
+
+    button.primary:hover {
+      background: var(--accent-strong);
+    }
+
+    button.secondary {
+      color: var(--text);
+      background: #fff;
+      border-color: var(--line);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+
+    .status {
+      margin-left: auto;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .status.ok {
+      color: var(--ok);
+    }
+
+    .status.error {
+      color: var(--danger);
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 10px;
+      background: #fbfcfe;
+    }
+
+    .metric .value {
+      display: block;
+      margin-top: 2px;
+      font-size: 20px;
+      font-weight: 750;
+    }
+
+    .log {
+      height: 520px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: var(--code);
+      color: #dbe4f0;
+      padding: 10px;
+      font-family: "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    .hint {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    @media (max-width: 900px) {
+      main {
+        width: min(100vw - 20px, 760px);
+        margin: 14px auto;
+      }
+
+      .layout,
+      .row {
+        grid-template-columns: 1fr;
+      }
+
+      .metrics {
+        grid-template-columns: 1fr;
+      }
+
+      .status {
+        margin-left: 0;
+      }
+
+      .actions {
+        flex-wrap: wrap;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Audio SSE Player</h1>
+    <div class="layout">
+      <section>
+        <div class="row">
+          <div>
+            <label for="url">Service URL</label>
+            <input id="url" value="http://localhost:8000/v1/audio/speech" spellcheck="false">
+          </div>
+          <div>
+            <label for="sampleRate">PCM Sample Rate</label>
+            <input id="sampleRate" type="number" min="8000" step="1000" value="24000">
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="payload">Request JSON</label>
+          <textarea id="payload" spellcheck="false">{
+  "input": "Hello, this is a streaming speech test.",
+  "voice": "alloy",
+  "response_format": "pcm",
+  "stream_format": "sse"
+}</textarea>
+          <p class="hint">Use <code>response_format</code> as <code>pcm</code> or <code>wav</code>. The page plays each <code>speech.audio.delta</code> as it arrives.</p>
+        </div>
+
+        <div class="actions">
+          <button id="send" class="primary" type="button">Send</button>
+          <button id="stop" class="secondary" type="button" disabled>Stop</button>
+          <button id="clear" class="secondary" type="button">Clear Log</button>
+          <span id="status" class="status">Idle</span>
+        </div>
+      </section>
+
+      <aside>
+        <div class="metrics">
+          <div class="metric">
+            <label>Chunks</label>
+            <span id="chunkCount" class="value">0</span>
+          </div>
+          <div class="metric">
+            <label>Bytes</label>
+            <span id="byteCount" class="value">0</span>
+          </div>
+          <div class="metric">
+            <label>Queued</label>
+            <span id="queuedTime" class="value">0.00s</span>
+          </div>
+          <div class="metric">
+            <label>Format</label>
+            <span id="formatValue" class="value">pcm</span>
+          </div>
+        </div>
+        <div id="log" class="log"></div>
+      </aside>
+    </div>
+  </main>
+
+  <script>
+    const urlInput = document.getElementById("url");
+    const sampleRateInput = document.getElementById("sampleRate");
+    const payloadInput = document.getElementById("payload");
+    const sendButton = document.getElementById("send");
+    const stopButton = document.getElementById("stop");
+    const clearButton = document.getElementById("clear");
+    const statusEl = document.getElementById("status");
+    const logEl = document.getElementById("log");
+    const chunkCountEl = document.getElementById("chunkCount");
+    const byteCountEl = document.getElementById("byteCount");
+    const queuedTimeEl = document.getElementById("queuedTime");
+    const formatValueEl = document.getElementById("formatValue");
+
+    let abortController = null;
+    let audioContext = null;
+    let nextPlayTime = 0;
+    let chunkCount = 0;
+    let byteCount = 0;
+    let currentFormat = "pcm";
+    let pcmSampleRate = 24000;
+    let channels = 1;
+    let wavHeaderParsed = false;
+
+    function setStatus(text, kind = "") {
+      statusEl.textContent = text;
+      statusEl.className = `status ${kind}`.trim();
+    }
+
+    function log(message) {
+      const time = new Date().toLocaleTimeString();
+      logEl.textContent += `[${time}] ${message}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    function resetStats(format) {
+      chunkCount = 0;
+      byteCount = 0;
+      currentFormat = format || "pcm";
+      wavHeaderParsed = false;
+      channels = 1;
+      nextPlayTime = 0;
+      chunkCountEl.textContent = "0";
+      byteCountEl.textContent = "0";
+      queuedTimeEl.textContent = "0.00s";
+      formatValueEl.textContent = currentFormat;
+    }
+
+    function updateStats(bytes) {
+      chunkCount += 1;
+      byteCount += bytes;
+      chunkCountEl.textContent = String(chunkCount);
+      byteCountEl.textContent = String(byteCount);
+      if (audioContext) {
+        const queued = Math.max(0, nextPlayTime - audioContext.currentTime);
+        queuedTimeEl.textContent = `${queued.toFixed(2)}s`;
+      }
+    }
+
+    function base64ToUint8Array(base64) {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i += 1) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function parseWavHeader(bytes) {
+      if (bytes.length < 44) {
+        throw new Error("WAV header chunk is shorter than 44 bytes");
+      }
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const riff = String.fromCharCode(bytes[0], bytes[1], bytes[2], bytes[3]);
+      const wave = String.fromCharCode(bytes[8], bytes[9], bytes[10], bytes[11]);
+      if (riff !== "RIFF" || wave !== "WAVE") {
+        throw new Error("Invalid WAV header");
+      }
+      channels = view.getUint16(22, true);
+      pcmSampleRate = view.getUint32(24, true);
+      const bitsPerSample = view.getUint16(34, true);
+      if (bitsPerSample !== 16) {
+        throw new Error(`Only 16-bit PCM WAV is supported, got ${bitsPerSample}`);
+      }
+      wavHeaderParsed = true;
+      log(`WAV header parsed: ${pcmSampleRate} Hz, ${channels} channel(s), ${bitsPerSample}-bit`);
+    }
+
+    function pcm16ToAudioBuffer(bytes) {
+      const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const frameCount = Math.floor(bytes.byteLength / 2 / channels);
+      const buffer = audioContext.createBuffer(channels, frameCount, pcmSampleRate);
+
+      for (let ch = 0; ch < channels; ch += 1) {
+        const channelData = buffer.getChannelData(ch);
+        for (let frame = 0; frame < frameCount; frame += 1) {
+          const sampleIndex = (frame * channels + ch) * 2;
+          channelData[frame] = view.getInt16(sampleIndex, true) / 32768;
+        }
+      }
+
+      return buffer;
+    }
+
+    async function ensureAudioContext() {
+      if (!audioContext || audioContext.state === "closed") {
+        audioContext = new AudioContext({ sampleRate: pcmSampleRate });
+      }
+      if (audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+      if (nextPlayTime < audioContext.currentTime) {
+        nextPlayTime = audioContext.currentTime + 0.04;
+      }
+    }
+
+    async function playPcmBytes(bytes) {
+      if (!bytes.length) {
+        return;
+      }
+      await ensureAudioContext();
+      const buffer = pcm16ToAudioBuffer(bytes);
+      const source = audioContext.createBufferSource();
+      source.buffer = buffer;
+      source.connect(audioContext.destination);
+      source.start(nextPlayTime);
+      nextPlayTime += buffer.duration;
+      updateStats(bytes.byteLength);
+    }
+
+    async function handleAudioDelta(payload) {
+      if (!payload.delta) {
+        throw new Error("speech.audio.delta event is missing delta");
+      }
+      const bytes = base64ToUint8Array(payload.delta);
+      const eventFormat = payload.response_format || currentFormat;
+
+      if (eventFormat === "wav" && !wavHeaderParsed) {
+        parseWavHeader(bytes);
+        updateStats(bytes.byteLength);
+        return;
+      }
+
+      await playPcmBytes(bytes);
+    }
+
+    function parseSseBlock(block) {
+      const lines = block.split(/\r?\n/);
+      let event = "message";
+      const dataLines = [];
+      for (const line of lines) {
+        if (line.startsWith("event:")) {
+          event = line.slice(6).trim();
+        } else if (line.startsWith("data:")) {
+          dataLines.push(line.slice(5).trimStart());
+        }
+      }
+      return { event, data: dataLines.join("\n") };
+    }
+
+    async function readSseStream(response) {
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        buffer += decoder.decode(value, { stream: true });
+
+        let boundary = buffer.search(/\r?\n\r?\n/);
+        while (boundary !== -1) {
+          const block = buffer.slice(0, boundary);
+          const match = buffer.match(/\r?\n\r?\n/);
+          buffer = buffer.slice(boundary + match[0].length);
+          if (block.trim()) {
+            const parsed = parseSseBlock(block);
+            await handleSseEvent(parsed);
+          }
+          boundary = buffer.search(/\r?\n\r?\n/);
+        }
+      }
+
+      if (buffer.trim()) {
+        await handleSseEvent(parseSseBlock(buffer));
+      }
+    }
+
+    async function handleSseEvent({ event, data }) {
+      log(`${event}: ${data}`);
+      if (!data || data === "[DONE]") {
+        return;
+      }
+
+      const payload = JSON.parse(data);
+      if (event === "speech.audio.delta" || payload.type === "speech.audio.delta") {
+        await handleAudioDelta(payload);
+      } else if (event === "speech.audio.done" || payload.type === "speech.audio.done") {
+        setStatus("Done", "ok");
+      } else if (event === "speech.audio.error" || payload.type === "speech.audio.error") {
+        throw new Error(payload.error?.message || "Server returned speech.audio.error");
+      }
+    }
+
+    async function sendRequest() {
+      let payload;
+      try {
+        payload = JSON.parse(payloadInput.value);
+      } catch (error) {
+        setStatus("Invalid JSON", "error");
+        log(`Invalid JSON: ${error.message}`);
+        return;
+      }
+
+      payload.stream_format = "sse";
+      currentFormat = String(payload.response_format || "pcm").toLowerCase();
+      if (currentFormat !== "pcm" && currentFormat !== "wav") {
+        setStatus("Unsupported stream format", "error");
+        log("Use response_format pcm or wav for immediate playback.");
+        return;
+      }
+
+      pcmSampleRate = Number(sampleRateInput.value) || 24000;
+      resetStats(currentFormat);
+      setStatus("Connecting...");
+      sendButton.disabled = true;
+      stopButton.disabled = false;
+      abortController = new AbortController();
+
+      try {
+        await ensureAudioContext();
+        const response = await fetch(urlInput.value, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+          signal: abortController.signal,
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`HTTP ${response.status}: ${text}`);
+        }
+
+        const contentType = response.headers.get("content-type") || "";
+        if (!contentType.includes("text/event-stream")) {
+          log(`Warning: content-type is ${contentType || "empty"}, expected text/event-stream`);
+        }
+
+        setStatus("Streaming...", "ok");
+        await readSseStream(response);
+        setStatus("Done", "ok");
+      } catch (error) {
+        if (error.name === "AbortError") {
+          setStatus("Stopped");
+          log("Request stopped by user.");
+        } else {
+          setStatus("Error", "error");
+          log(`Error: ${error.message}`);
+        }
+      } finally {
+        sendButton.disabled = false;
+        stopButton.disabled = true;
+        abortController = null;
+      }
+    }
+
+    sendButton.addEventListener("click", sendRequest);
+    stopButton.addEventListener("click", () => {
+      if (abortController) {
+        abortController.abort();
+      }
+    });
+    clearButton.addEventListener("click", () => {
+      logEl.textContent = "";
+    });
+  </script>
+</body>
+</html>
