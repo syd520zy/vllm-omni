@@ -2731,7 +2731,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         raw_request: Request | None = None,
         request_start_s: float | None = None,
     ):
-        """Generate OpenAI-style SSE events with base64 audio deltas."""
+        """Generate OpenAI-style SSE events with base64 audio deltas.
+
+        Field naming follows the OpenAI ``speech.audio.delta`` schema, which
+        carries the base64 chunk in ``audio`` (not ``delta`` — that is the
+        Realtime API ``response.audio.delta`` convention, a different event).
+        See https://platform.openai.com/docs/api-reference/audio-streaming.
+        """
         try:
             async for chunk in self._generate_audio_chunks(
                 generator,
@@ -2742,7 +2748,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             ):
                 payload = {
                     "type": "speech.audio.delta",
-                    "delta": base64.b64encode(chunk).decode("ascii"),
+                    "audio": base64.b64encode(chunk).decode("ascii"),
                     "response_format": response_format,
                 }
                 data = json.dumps(payload, separators=(",", ":"))
@@ -3886,8 +3892,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 response_format = (request.response_format or "wav").lower()
                 if response_format not in ["pcm", "wav"]:
                     return self.create_error_response(
-                        f"SSE streaming is only supported for 'pcm' and 'wav' formats. "
-                        f"Got '{response_format}'."
+                        f"SSE streaming is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
                     )
 
                 if request.speed is not None and request.speed != 1.0:

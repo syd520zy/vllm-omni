@@ -1960,6 +1960,114 @@ class TestStreamingResponse:
         assert "text/event-stream" not in response.headers["content-type"]
         assert len(response.content) > 0
 
+    def test_sse_streaming(self, streaming_app):
+        """stream_format=sse without stream=True returns audio deltas as SSE."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "event: speech.audio.delta" in body
+        assert "event: speech.audio.done" in body
+        data_line = next(line for line in body.splitlines() if line.startswith("data: "))
+        payload = json.loads(data_line.removeprefix("data: "))
+        assert payload["type"] == "speech.audio.delta"
+        assert payload["response_format"] == "pcm"
+        assert base64.b64decode(payload["audio"])
+
+    def test_stream_true_prefers_raw_audio_over_sse(self, streaming_app):
+        """stream=True keeps the existing raw audio stream behavior even with stream_format=sse."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "stream_format": "sse", "response_format": "pcm"},
+        )
+
+        assert response.status_code == 200
+        assert "audio/pcm" in response.headers["content-type"]
+        assert "text/event-stream" not in response.headers["content-type"]
+        assert len(response.content) > 0
+
+    def test_sse_rejects_unsupported_response_format(self, streaming_app):
+        """stream_format=sse with a non-pcm/wav format must fail before streaming starts."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "mp3"},
+        )
+
+        assert response.status_code == 400
+        assert "text/event-stream" not in response.headers.get("content-type", "")
+
+    def test_sse_rejects_speed_adjustment(self, streaming_app):
+        """stream_format=sse with speed != 1.0 must fail before streaming starts."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm", "speed": 2.0},
+        )
+
+        assert response.status_code == 400
+        assert "text/event-stream" not in response.headers.get("content-type", "")
+
+    @pytest.fixture
+    def erroring_streaming_app(self, mocker: MockerFixture):
+        """Test app whose mock engine raises mid-stream, to exercise the SSE error event."""
+
+        async def mock_generate_streaming(*args, **kwargs):
+            raise RuntimeError("boom: simulated engine failure")
+            yield  # pragma: no cover - generator marker, unreachable
+
+        mock_engine_client = mocker.MagicMock()
+        mock_engine_client.errored = False
+        mock_engine_client.generate = mocker.MagicMock(side_effect=mock_generate_streaming)
+        mock_engine_client.default_sampling_params_list = [{}]
+        mock_models = mocker.MagicMock()
+        mock_models.is_base_model.return_value = True
+
+        speech_server = OmniOpenAIServingSpeech(
+            engine_client=mock_engine_client,
+            models=mock_models,
+            request_logger=mocker.MagicMock(),
+        )
+
+        original_create_speech = speech_server.create_speech
+        sig = signature(original_create_speech)
+        new_parameters = [p for name, p in sig.parameters.items() if name != "raw_request"]
+        new_sig = Signature(parameters=new_parameters, return_annotation=sig.return_annotation)
+
+        async def awaitable_create_speech(*args, **kwargs):
+            return await original_create_speech(*args, **kwargs)
+
+        awaitable_create_speech.__signature__ = new_sig
+        speech_server.create_speech = awaitable_create_speech
+
+        app = FastAPI()
+        app.add_api_route("/v1/audio/speech", speech_server.create_speech, methods=["POST"], response_model=None)
+        return app
+
+    def test_sse_emits_error_event_on_generator_failure(self, erroring_streaming_app):
+        """An exception inside the SSE generator must surface as a speech.audio.error event."""
+        client = TestClient(erroring_streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "event: speech.audio.error" in body
+        error_line = next(line for line in body.splitlines() if line.startswith("data: "))
+        payload = json.loads(error_line.removeprefix("data: "))
+        assert payload["type"] == "speech.audio.error"
+        assert "error" in payload
+        assert payload["error"]["message"]
+
     def test_non_streaming_unchanged(self, streaming_app):
         """Non-streaming path must still return audio/wav."""
         client = TestClient(streaming_app)
