@@ -2723,6 +2723,47 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
 
+    async def _generate_audio_sse_events(
+        self,
+        generator,
+        request_id: str,
+        response_format: str = "pcm",
+        raw_request: Request | None = None,
+        request_start_s: float | None = None,
+    ):
+        """Generate OpenAI-style SSE events with base64 audio deltas."""
+        try:
+            async for chunk in self._generate_audio_chunks(
+                generator,
+                request_id,
+                response_format,
+                raw_request=raw_request,
+                request_start_s=request_start_s,
+            ):
+                payload = {
+                    "type": "speech.audio.delta",
+                    "delta": base64.b64encode(chunk).decode("ascii"),
+                    "response_format": response_format,
+                }
+                data = json.dumps(payload, separators=(",", ":"))
+                yield f"event: speech.audio.delta\ndata: {data}\n\n"
+            done = json.dumps({"type": "speech.audio.done"}, separators=(",", ":"))
+            yield f"event: speech.audio.done\ndata: {done}\n\n"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            payload = {
+                "type": "speech.audio.error",
+                "error": {
+                    "message": str(e),
+                    "type": "server_error",
+                    "param": None,
+                    "code": HTTPStatus.INTERNAL_SERVER_ERROR.value,
+                },
+            }
+            data = json.dumps(payload, separators=(",", ":"))
+            yield f"event: speech.audio.error\ndata: {data}\n\n"
+
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
         """Return (audio_output dict, audio key) or (None, None).
@@ -3300,7 +3341,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # we don't emit redundant MM data & drain after emitting.
         # list() makes a copy to avoid mutating the params.
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
-        sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+        is_streaming_request = request.stream or request.stream_format == "sse"
+        sampling_params_list = coerce_param_message_types(sampling_params_list, is_streaming_request)
 
         # Build prompt + tts_params via the per-model adapter (RFC #4327). Every
         # dedicated TTS model resolves to an adapter that owns its validation,
@@ -3839,6 +3881,32 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         request_start_s=request_start_s,
                     ),
                     media_type=media_type,
+                )
+
+            if request.stream_format == "sse":
+                response_format = (request.response_format or "wav").lower()
+                if response_format not in ["pcm", "wav"]:
+                    return self.create_error_response(
+                        f"SSE streaming is only supported for 'pcm' and 'wav' formats. "
+                        f"Got '{response_format}'."
+                    )
+
+                if request.speed is not None and request.speed != 1.0:
+                    return self.create_error_response(
+                        "SSE streaming is not supported with speed adjustment. "
+                        "Use stream_format='audio' or remove the speed parameter."
+                    )
+
+                _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                return StreamingResponse(
+                    self._generate_audio_sse_events(
+                        generator,
+                        request_id,
+                        response_format,
+                        raw_request=raw_request,
+                        request_start_s=request_start_s,
+                    ),
+                    media_type="text/event-stream",
                 )
 
             audio_bytes, media_type = await self._generate_audio_bytes(request, request_id=request_id)
