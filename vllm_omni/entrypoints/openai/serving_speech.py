@@ -3859,8 +3859,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 # Only pcm and wav support streaming without post-processing
                 if response_format not in ["pcm", "wav"]:
                     return self.create_error_response(
-                        f"Streaming is only supported for 'pcm' and 'wav' formats. "
-                        f"Got '{response_format}'. For other formats, use stream=False."
+                        f"SSE streaming is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
                     )
 
                 # Check if speed adjustment is requested (not compatible with streaming)
