@@ -250,7 +250,7 @@
   "response_format": "pcm",
   "stream_format": "sse"
 }</textarea>
-          <p class="hint">Use <code>response_format</code> as <code>pcm</code> or <code>wav</code>. The page plays each <code>speech.audio.delta</code> as it arrives.</p>
+          <p class="hint">Use <code>response_format</code> as <code>pcm</code> or <code>wav</code>. Add <code>stream_format: "sse"</code> for SSE, or omit it for the original audio byte stream.</p>
         </div>
 
         <div class="actions">
@@ -329,6 +329,7 @@
     let scriptQueue = [];
     let scriptQueuedFrames = 0;
     let playbackStarted = false;
+    let inputStreaming = false;
     let bufferedSamples = 0;
     let fallbackNextPlayTime = 0;
     let underrunCount = 0;
@@ -339,6 +340,7 @@
     let pcmSampleRate = 24000;
     let channels = 1;
     let wavHeaderParsed = false;
+    let wavHeaderBuffer = new Uint8Array(0);
 
     function setStatus(text, kind = "") {
       statusEl.textContent = text;
@@ -356,8 +358,10 @@
       byteCount = 0;
       currentFormat = format || "pcm";
       wavHeaderParsed = false;
+      wavHeaderBuffer = new Uint8Array(0);
       channels = 1;
       playbackStarted = false;
+      inputStreaming = false;
       bufferedSamples = 0;
       fallbackNextPlayTime = 0;
       scriptQueue = [];
@@ -580,7 +584,7 @@
             for (let ch = 0; ch < output.numberOfChannels; ch += 1) {
               output.getChannelData(ch)[frame] = 0;
             }
-            hadUnderrun = playbackStarted;
+            hadUnderrun = playbackStarted && inputStreaming;
             continue;
           }
 
@@ -704,6 +708,40 @@
       processMsEl.textContent = `${(performance.now() - startedAt).toFixed(1)}ms`;
     }
 
+    async function handleRawAudioChunk(bytes) {
+      if (!bytes.length) {
+        return;
+      }
+      const startedAt = performance.now();
+      if (lastArrivalTime) {
+        lastGapEl.textContent = `${(startedAt - lastArrivalTime).toFixed(0)}ms`;
+      }
+      lastArrivalTime = startedAt;
+
+      if (currentFormat === "wav" && !wavHeaderParsed) {
+        const merged = new Uint8Array(wavHeaderBuffer.length + bytes.length);
+        merged.set(wavHeaderBuffer);
+        merged.set(bytes, wavHeaderBuffer.length);
+        if (merged.length < 44) {
+          wavHeaderBuffer = merged;
+          processMsEl.textContent = `${(performance.now() - startedAt).toFixed(1)}ms`;
+          return;
+        }
+
+        parseWavHeader(merged);
+        wavHeaderBuffer = new Uint8Array(0);
+        updateStats(44);
+        const pcmBytes = merged.slice(44);
+        if (pcmBytes.length) {
+          await playPcmBytes(pcmBytes);
+        }
+      } else {
+        await playPcmBytes(bytes);
+      }
+
+      processMsEl.textContent = `${(performance.now() - startedAt).toFixed(1)}ms`;
+    }
+
     function parseSseBlock(block) {
       const lines = block.split(/\r?\n/);
       let event = "message";
@@ -751,6 +789,9 @@
     async function handleSseEvent({ event, data }) {
       if (!data || data === "[DONE]") {
         log(`${event}: ${data || ""}`);
+        if (data === "[DONE]") {
+          inputStreaming = false;
+        }
         return;
       }
 
@@ -761,12 +802,24 @@
         await handleAudioDelta(payload);
       } else if (event === "speech.audio.done" || payload.type === "speech.audio.done") {
         log(`${event}: done`);
+        inputStreaming = false;
         setStatus("Done", "ok");
       } else if (event === "speech.audio.error" || payload.type === "speech.audio.error") {
         log(`${event}: ${data}`);
         throw new Error(payload.error?.message || "Server returned speech.audio.error");
       } else {
         log(`${event}: ${data}`);
+      }
+    }
+
+    async function readRawAudioStream(response) {
+      const reader = response.body.getReader();
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          break;
+        }
+        await handleRawAudioChunk(value);
       }
     }
 
@@ -780,7 +833,6 @@
         return;
       }
 
-      payload.stream_format = "sse";
       currentFormat = String(payload.response_format || "pcm").toLowerCase();
       if (currentFormat !== "pcm" && currentFormat !== "wav") {
         setStatus("Unsupported stream format", "error");
@@ -794,6 +846,7 @@
       sendButton.disabled = true;
       stopButton.disabled = false;
       abortController = new AbortController();
+      inputStreaming = true;
 
       try {
         await ensureAudioContext();
@@ -810,14 +863,18 @@
         }
 
         const contentType = response.headers.get("content-type") || "";
-        if (!contentType.includes("text/event-stream")) {
-          log(`Warning: content-type is ${contentType || "empty"}, expected text/event-stream`);
-        }
 
         setStatus("Streaming...", "ok");
-        await readSseStream(response);
+        if (contentType.includes("text/event-stream")) {
+          await readSseStream(response);
+        } else {
+          log(`Reading raw audio stream: ${contentType || "empty content-type"}`);
+          await readRawAudioStream(response);
+        }
+        inputStreaming = false;
         setStatus("Done", "ok");
       } catch (error) {
+        inputStreaming = false;
         if (error.name === "AbortError") {
           setStatus("Stopped");
           log("Request stopped by user.");
@@ -835,6 +892,7 @@
     sendButton.addEventListener("click", sendRequest);
     stopButton.addEventListener("click", () => {
       if (abortController) {
+        inputStreaming = false;
         abortController.abort();
       }
     });
