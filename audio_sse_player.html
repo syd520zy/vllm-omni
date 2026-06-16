@@ -341,6 +341,7 @@
     let channels = 1;
     let wavHeaderParsed = false;
     let wavHeaderBuffer = new Uint8Array(0);
+    let pcmRemainderBuffer = new Uint8Array(0);
 
     function setStatus(text, kind = "") {
       statusEl.textContent = text;
@@ -359,6 +360,7 @@
       currentFormat = format || "pcm";
       wavHeaderParsed = false;
       wavHeaderBuffer = new Uint8Array(0);
+      pcmRemainderBuffer = new Uint8Array(0);
       channels = 1;
       playbackStarted = false;
       inputStreaming = false;
@@ -453,6 +455,17 @@
       }
 
       return { samples, frameCount };
+    }
+
+    function takeAlignedPcmBytes(bytes) {
+      const frameBytes = 2 * channels;
+      const merged = new Uint8Array(pcmRemainderBuffer.length + bytes.length);
+      merged.set(pcmRemainderBuffer);
+      merged.set(bytes, pcmRemainderBuffer.length);
+
+      const alignedLength = merged.length - (merged.length % frameBytes);
+      pcmRemainderBuffer = merged.slice(alignedLength);
+      return merged.slice(0, alignedLength);
     }
 
     function pcm16ToAudioBuffer(bytes) {
@@ -724,6 +737,7 @@
         merged.set(bytes, wavHeaderBuffer.length);
         if (merged.length < 44) {
           wavHeaderBuffer = merged;
+          log(`raw.audio.chunk: ${bytes.byteLength} byte(s), waiting for WAV header (${merged.length}/44).`);
           processMsEl.textContent = `${(performance.now() - startedAt).toFixed(1)}ms`;
           return;
         }
@@ -733,10 +747,20 @@
         updateStats(44);
         const pcmBytes = merged.slice(44);
         if (pcmBytes.length) {
-          await playPcmBytes(pcmBytes);
+          const alignedPcmBytes = takeAlignedPcmBytes(pcmBytes);
+          log(`raw.audio.chunk: ${bytes.byteLength} byte(s), pcm=${alignedPcmBytes.byteLength} byte(s), remainder=${pcmRemainderBuffer.byteLength}.`);
+          if (alignedPcmBytes.length) {
+            await playPcmBytes(alignedPcmBytes);
+          }
+        } else {
+          log(`raw.audio.chunk: ${bytes.byteLength} byte(s), WAV header only.`);
         }
       } else {
-        await playPcmBytes(bytes);
+        const alignedPcmBytes = takeAlignedPcmBytes(bytes);
+        log(`raw.audio.chunk: ${bytes.byteLength} byte(s), pcm=${alignedPcmBytes.byteLength} byte(s), remainder=${pcmRemainderBuffer.byteLength}.`);
+        if (alignedPcmBytes.length) {
+          await playPcmBytes(alignedPcmBytes);
+        }
       }
 
       processMsEl.textContent = `${(performance.now() - startedAt).toFixed(1)}ms`;
@@ -820,6 +844,10 @@
           break;
         }
         await handleRawAudioChunk(value);
+      }
+      if (pcmRemainderBuffer.length) {
+        log(`Dropped ${pcmRemainderBuffer.length} trailing unaligned PCM byte(s).`);
+        pcmRemainderBuffer = new Uint8Array(0);
       }
     }
 
