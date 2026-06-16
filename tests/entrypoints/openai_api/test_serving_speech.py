@@ -1821,8 +1821,12 @@ class TestStreamingResponse:
         assert "audio/pcm" in response.headers["content-type"]
         assert len(response.content) > 0
 
-    def test_sse_streaming(self, streaming_app):
+    def test_sse_streaming(self, streaming_app, mocker: MockerFixture):
         """stream_format=sse must return OpenAI-style base64 audio delta events."""
+        coerce_params = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            side_effect=lambda params, stream: params,
+        )
         client = TestClient(streaming_app)
         response = client.post(
             "/v1/audio/speech",
@@ -1847,6 +1851,8 @@ class TestStreamingResponse:
             assert payload["type"] == "speech.audio.delta"
             assert payload["response_format"] == "pcm"
             assert base64.b64decode(payload["delta"])
+        coerce_params.assert_called()
+        assert coerce_params.call_args.args[1] is True
 
     def test_non_streaming_unchanged(self, streaming_app):
         """Non-streaming path must still return audio/wav."""

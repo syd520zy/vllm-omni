@@ -2761,13 +2761,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         request_id = request_id or f"speech-{random_uuid()}"
         qwen3_ref_audio_warmup_artifact_key: str | None = None
+        is_streaming_request = request.stream or request.stream_format == "sse"
 
         # If this is a streaming request, we need to coerce
         # cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.
         # list() makes a copy to avoid mutating the params.
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
-        sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
+        sampling_params_list = coerce_param_message_types(sampling_params_list, is_streaming_request)
 
         # Resolve uploaded voice for non-Qwen3 models.
         # Qwen3 TTS has its own uploaded voice handling in _build_tts_params().
