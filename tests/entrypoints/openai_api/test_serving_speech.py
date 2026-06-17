@@ -1945,38 +1945,6 @@ class TestStreamingResponse:
         payload = json.loads(data_line.removeprefix("data: "))
         assert payload["type"] == "speech.audio.delta"
         assert payload["response_format"] == "pcm"
-        assert base64.b64decode(payload["delta"])
-
-    def test_stream_true_prefers_raw_audio_over_sse(self, streaming_app):
-        """stream=True keeps the existing raw audio stream behavior even with stream_format=sse."""
-        client = TestClient(streaming_app)
-        response = client.post(
-            "/v1/audio/speech",
-            json={"input": "Hello", "stream": True, "stream_format": "sse", "response_format": "pcm"},
-        )
-
-        assert response.status_code == 200
-        assert "audio/pcm" in response.headers["content-type"]
-        assert "text/event-stream" not in response.headers["content-type"]
-        assert len(response.content) > 0
-
-    def test_sse_streaming(self, streaming_app):
-        """stream_format=sse without stream=True returns audio deltas as SSE."""
-        client = TestClient(streaming_app)
-        response = client.post(
-            "/v1/audio/speech",
-            json={"input": "Hello", "stream_format": "sse", "response_format": "pcm"},
-        )
-
-        assert response.status_code == 200
-        assert "text/event-stream" in response.headers["content-type"]
-        body = response.text
-        assert "event: speech.audio.delta" in body
-        assert "event: speech.audio.done" in body
-        data_line = next(line for line in body.splitlines() if line.startswith("data: "))
-        payload = json.loads(data_line.removeprefix("data: "))
-        assert payload["type"] == "speech.audio.delta"
-        assert payload["response_format"] == "pcm"
         assert base64.b64decode(payload["audio"])
 
     def test_stream_true_prefers_raw_audio_over_sse(self, streaming_app):
