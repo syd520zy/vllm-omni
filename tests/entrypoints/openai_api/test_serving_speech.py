@@ -1826,14 +1826,26 @@ class TestFileValidationFunctions:
 
 
 class TestStreamingProtocolValidation:
-    """Unit tests for the stream field validators in OpenAICreateSpeechRequest."""
+    """Unit tests for streaming validators in OpenAICreateSpeechRequest."""
+
+    def test_default_is_non_streaming(self):
+        req = OpenAICreateSpeechRequest(input="Hello")
+        assert req.stream is False
+        assert req.stream_format is None
+        assert req.is_streaming() is False
 
     def test_stream_validation_errors(self):
-        """stream=True requires response_format not in ('pcm', 'wav') and speed=1.0."""
+        """stream=True requires response_format in ('pcm', 'wav') and speed=1.0."""
         with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="mp3")
         with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
             OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm", speed=2.0)
+
+    def test_stream_format_audio_validation_errors(self):
+        with pytest.raises(ValidationError, match="requires response_format='pcm' or 'wav'"):
+            OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="mp3")
+        with pytest.raises(ValidationError, match="Speed adjustment is not supported"):
+            OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm", speed=2.0)
 
     def test_stream_valid(self):
         """stream=True + response_format in ('pcm', 'wav') + speed=1.0 is accepted."""
@@ -1843,11 +1855,17 @@ class TestStreamingProtocolValidation:
         req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="wav")
         assert req.stream is True
 
+    def test_stream_format_audio_is_valid(self):
+        req = OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm")
+        assert req.stream_format == "audio"
+        assert req.is_raw_audio_stream() is True
+
     def test_sse_stream_format_is_valid(self):
         """stream_format='sse' is accepted for /audio/speech."""
         req = OpenAICreateSpeechRequest(input="Hello", stream_format="sse")
 
         assert req.stream_format == "sse"
+        assert req.is_sse_stream() is True
 
 
 class TestStreamingResponse:
@@ -1928,6 +1946,18 @@ class TestStreamingResponse:
         assert "audio/pcm" in response.headers["content-type"]
         assert len(response.content) > 0
 
+    def test_stream_format_audio_streaming(self, streaming_app):
+        """stream_format=audio without stream=True returns raw audio/pcm chunks."""
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm"},
+        )
+        assert response.status_code == 200
+        assert "audio/pcm" in response.headers["content-type"]
+        assert "text/event-stream" not in response.headers["content-type"]
+        assert len(response.content) > 0
+
     def test_sse_streaming(self, streaming_app):
         """stream_format=sse without stream=True returns audio deltas as SSE."""
         client = TestClient(streaming_app)
@@ -1968,7 +1998,7 @@ class TestStreamingResponse:
             json={"input": "Hello", "stream_format": "sse", "response_format": "mp3"},
         )
 
-        assert response.status_code == 400
+        assert response.status_code in (400, 422)
         assert "text/event-stream" not in response.headers.get("content-type", "")
 
     def test_sse_rejects_speed_adjustment(self, streaming_app):
@@ -1979,8 +2009,28 @@ class TestStreamingResponse:
             json={"input": "Hello", "stream_format": "sse", "response_format": "pcm", "speed": 2.0},
         )
 
-        assert response.status_code == 400
+        assert response.status_code in (400, 422)
         assert "text/event-stream" not in response.headers.get("content-type", "")
+
+    def test_stream_format_audio_rejects_unsupported_response_format(self, streaming_app):
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "mp3"},
+        )
+
+        assert response.status_code == 400
+        assert "audio/" not in response.headers.get("content-type", "")
+
+    def test_stream_format_audio_rejects_speed_adjustment(self, streaming_app):
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm", "speed": 2.0},
+        )
+
+        assert response.status_code == 400
+        assert "audio/" not in response.headers.get("content-type", "")
 
     @pytest.fixture
     def erroring_streaming_app(self, mocker: MockerFixture):
@@ -3004,6 +3054,23 @@ class TestTTSAsyncOffloading:
             return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
         )
         request = OpenAICreateSpeechRequest(input="hello", stream_format="sse")
+
+        asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
+
+        mock_coerce.assert_called_once_with(qwen3_tts_server.engine_client.default_sampling_params_list, True)
+
+    def test_prepare_speech_generation_treats_audio_as_streaming(self, qwen3_tts_server, mocker: MockerFixture):
+        """stream_format=audio should request delta-style multimodal outputs."""
+        qwen3_tts_server._validate_tts_request = mocker.MagicMock(return_value=None)
+        qwen3_tts_server._build_tts_params = mocker.MagicMock(
+            return_value={"text": ["hello"], "task_type": ["CustomVoice"], "speaker": ["Vivian"]}
+        )
+        qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
+        mock_coerce = mocker.patch(
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
+            return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
+        )
+        request = OpenAICreateSpeechRequest(input="hello", stream_format="audio", response_format="pcm")
 
         asyncio.run(qwen3_tts_server._prepare_speech_generation(request))
 

@@ -2658,7 +2658,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         sample_rate=sample_rate_val,
                         response_format="pcm",
                         speed=1.0,
-                        stream_format="audio",
                         base64_encode=False,
                     )
                     if first_audio_chunk_s is None:
@@ -3347,7 +3346,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         # we don't emit redundant MM data & drain after emitting.
         # list() makes a copy to avoid mutating the params.
         sampling_params_list = list(self.engine_client.default_sampling_params_list)
-        is_streaming_request = request.stream or request.stream_format == "sse"
+        is_streaming_request = request.is_streaming()
         sampling_params_list = coerce_param_message_types(sampling_params_list, is_streaming_request)
 
         # Build prompt + tts_params via the per-model adapter (RFC #4327). Every
@@ -3674,7 +3673,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sample_rate=sample_rate,
                 response_format=request.response_format or "wav",
                 speed=request.speed or 1.0,
-                stream_format=request.stream_format,
                 base64_encode=base64_encode,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -3787,7 +3785,6 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 sample_rate=sample_rate,
                 response_format=request.response_format or "wav",
                 speed=request.speed or 1.0,
-                stream_format=request.stream_format,
                 base64_encode=False,
             )
             audio_response: AudioResponse = self.create_audio(audio_obj)
@@ -3817,6 +3814,25 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         error_body = json.dumps({"error": {"message": message, "type": err_type, "param": None, "code": status_code}})
         return Response(content=error_body, media_type="application/json", status_code=status_code)
 
+    def _validate_speech_streaming_request(
+        self,
+        request: OpenAICreateSpeechRequest,
+        *,
+        mode_label: str,
+    ) -> tuple[str, Response | None]:
+        """Validate pcm/wav + speed constraints for streaming speech responses."""
+        response_format = (request.response_format or "wav").lower()
+        if response_format not in ("pcm", "wav"):
+            return response_format, self.create_error_response(
+                f"{mode_label} is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
+            )
+        if request.speed is not None and request.speed != 1.0:
+            return response_format, self.create_error_response(
+                f"{mode_label} is not supported with speed adjustment. "
+                "Use a non-streaming request or remove the speed parameter."
+            )
+        return response_format, None
+
     async def create_speech(
         self,
         request: OpenAICreateSpeechRequest,
@@ -3838,7 +3854,9 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         - ref_text: Transcript of reference audio (Base task)
         - x_vector_only_mode: Use speaker embedding only (Base task)
 
-        Streaming is supported via stream=True with response_format='pcm' or 'wav'.
+        Streaming is supported via ``stream_format='audio'`` or the legacy
+        ``stream=True`` switch, with ``response_format='pcm'`` or ``'wav'``.
+        ``stream_format='sse'`` returns OpenAI ``speech.audio.*`` SSE events instead.
         Each Code2Wav chunk is yielded as raw audio bytes as soon as it is decoded.
         For WAV format, a header with placeholder size values is emitted first.
         """
@@ -3858,22 +3876,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         try:
-            if request.stream:
-                # Determine response format and media type for streaming
-                response_format = (request.response_format or "wav").lower()
-
-                # Only pcm and wav support streaming without post-processing
-                if response_format not in ["pcm", "wav"]:
-                    return self.create_error_response(
-                        f"SSE streaming is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
-                    )
-
-                # Check if speed adjustment is requested (not compatible with streaming)
-                if request.speed is not None and request.speed != 1.0:
-                    return self.create_error_response(
-                        "Streaming is not supported with speed adjustment. "
-                        "Use stream=False or remove the speed parameter."
-                    )
+            if request.is_raw_audio_stream():
+                response_format, error = self._validate_speech_streaming_request(
+                    request,
+                    mode_label="Streaming",
+                )
+                if error is not None:
+                    return error
 
                 media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
@@ -3888,18 +3897,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                     media_type=media_type,
                 )
 
-            if request.stream_format == "sse":
-                response_format = (request.response_format or "wav").lower()
-                if response_format not in ["pcm", "wav"]:
-                    return self.create_error_response(
-                        f"SSE streaming is only supported for 'pcm' and 'wav' formats. Got '{response_format}'."
-                    )
-
-                if request.speed is not None and request.speed != 1.0:
-                    return self.create_error_response(
-                        "SSE streaming is not supported with speed adjustment. "
-                        "Use stream_format='audio' or remove the speed parameter."
-                    )
+            if request.is_sse_stream():
+                response_format, error = self._validate_speech_streaming_request(
+                    request,
+                    mode_label="SSE streaming",
+                )
+                if error is not None:
+                    return error
 
                 _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
                 return StreamingResponse(
