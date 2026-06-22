@@ -29,9 +29,11 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import (
     uses_full_payload_input_coordinator,
 )
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData
+from vllm_omni.core.sched.utils import omni_routed_experts_for_request
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
 logger = init_logger(__name__)
@@ -85,7 +87,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._consume_pending_connector_output(model_mode="generation")
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+            self.chunk_transfer_adapter.process_pending_chunks(
+                self.waiting, self.running, scheduler_requests=self.requests
+            )
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
@@ -362,7 +366,23 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
+        # See ``OmniSchedulerMixin._realign_request_status_to_queues`` --
+        # closes the residual hang on the
+        # ``waiting → running → abort-before-next-deque-round-trip`` race
+        # surfaced by #3774's reproduction matrix. Only the
+        # ``async_chunk`` path actually triggers the staleness; with
+        # ``async_chunk`` disabled this is a cheap O(n) no-op, kept
+        # unconditional so the abort path stays uniform.
+        self._realign_request_status_to_queues(request_ids)
+
         finished = super().finish_requests(request_ids, finished_status)
+
+        # See ``OmniSchedulerMixin._purge_finished_from_running`` --
+        # defensive belt-and-suspenders sweep paired with the realign
+        # above. Closes residual ``self.running`` slot leaks if any
+        # corner case slips past upstream's status-driven removal.
+        self._purge_finished_from_running()
+
         if self.input_coordinator is not None:
             for request_id, _ in finished:
                 self._free_input_coordinator_request(request_id)
@@ -400,6 +420,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
+        mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
 
@@ -478,6 +499,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             new_token_ids = generated_token_ids
             kv_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+            mm_output = mm_outputs[req_index] if mm_outputs else None
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
@@ -499,11 +521,8 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 stopped = True
 
             if stopped:
-                if (
-                    model_runner_output.routed_experts_dict is not None
-                    and req_id in model_runner_output.routed_experts_dict
-                ):
-                    routed_experts = model_runner_output.routed_experts_dict[req_id]
+                if model_runner_output.routed_experts is not None:
+                    routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
                 finish_reason = request.get_finished_reason()
                 finished = self._handle_stopped_request(request)
                 if not finished:
@@ -524,7 +543,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     stopped_running_reqs.add(request)
 
             # Extract sample logprobs if needed.
-            if request.sampling_params is not None and request.sampling_params.logprobs is not None and logprobs:
+            if request.sampling_params is not None and request.sampling_params.num_logprobs is not None and logprobs:
                 new_logprobs = logprobs.slice_request(req_index, len(new_token_ids))
 
             if new_token_ids and self.structured_output_manager.should_advance(request):
@@ -541,15 +560,17 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
-            if new_token_ids or pooler_output is not None or kv_transfer_params or stopped:
+            if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    OmniEngineCoreOutput(
                         request_id=req_id,
                         new_token_ids=new_token_ids,
                         finish_reason=finish_reason,
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
+                        multimodal_output=mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
@@ -580,7 +601,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                         getattr(request, "external_req_id", None),
                     )
             outputs[request.client_index].append(
-                EngineCoreOutput(
+                OmniEngineCoreOutput(
                     request_id=request.request_id,
                     new_token_ids=[],
                     finish_reason=finish_reason,
@@ -607,7 +628,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.finish_requests(failed_kv_load_req_ids, RequestStatus.FINISHED_ERROR)
             for request in requests:
                 outputs[request.client_index].append(
-                    EngineCoreOutput(
+                    OmniEngineCoreOutput(
                         request_id=request.request_id,
                         new_token_ids=[],
                         finish_reason=request.get_finished_reason(),
