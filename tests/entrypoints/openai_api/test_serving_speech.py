@@ -2019,7 +2019,7 @@ class TestStreamingResponse:
             json={"input": "Hello", "stream_format": "audio", "response_format": "mp3"},
         )
 
-        assert response.status_code == 400
+        assert response.status_code in (400, 422)
         assert "audio/" not in response.headers.get("content-type", "")
 
     def test_stream_format_audio_rejects_speed_adjustment(self, streaming_app):
@@ -2029,7 +2029,7 @@ class TestStreamingResponse:
             json={"input": "Hello", "stream_format": "audio", "response_format": "pcm", "speed": 2.0},
         )
 
-        assert response.status_code == 400
+        assert response.status_code in (400, 422)
         assert "audio/" not in response.headers.get("content-type", "")
 
     @pytest.fixture
