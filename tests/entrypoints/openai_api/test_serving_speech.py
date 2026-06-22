@@ -1867,6 +1867,36 @@ class TestStreamingProtocolValidation:
         assert req.stream_format == "sse"
         assert req.is_sse_stream() is True
 
+    def test_env_default_stream_format_true_forces_stream_true_to_sse(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_AUDIO_SPEECH_DEFAULT_STREAM_FORMAT", "true")
+
+        req = OpenAICreateSpeechRequest(input="Hello", stream=True, response_format="pcm")
+
+        assert req.is_sse_stream() is True
+        assert req.is_raw_audio_stream() is False
+
+    def test_env_default_stream_format_true_keeps_stream_format_sse_as_sse(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_AUDIO_SPEECH_DEFAULT_STREAM_FORMAT", "true")
+
+        req = OpenAICreateSpeechRequest(input="Hello", stream_format="sse", response_format="pcm")
+
+        assert req.is_sse_stream() is True
+        assert req.is_raw_audio_stream() is False
+
+    def test_env_default_stream_format_true_keeps_stream_true_sse_as_sse(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_AUDIO_SPEECH_DEFAULT_STREAM_FORMAT", "true")
+
+        req = OpenAICreateSpeechRequest(input="Hello", stream=True, stream_format="sse", response_format="pcm")
+
+        assert req.is_sse_stream() is True
+        assert req.is_raw_audio_stream() is False
+
+    def test_env_default_stream_format_true_rejects_audio_stream_format(self, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_AUDIO_SPEECH_DEFAULT_STREAM_FORMAT", "true")
+
+        with pytest.raises(ValidationError, match="stream_format='audio' is not supported"):
+            OpenAICreateSpeechRequest(input="Hello", stream_format="audio", response_format="pcm")
+
 
 class TestStreamingResponse:
     """Integration tests for the streaming audio response path."""
@@ -1989,6 +2019,38 @@ class TestStreamingResponse:
         assert "audio/pcm" in response.headers["content-type"]
         assert "text/event-stream" not in response.headers["content-type"]
         assert len(response.content) > 0
+
+    def test_env_default_stream_format_true_stream_true_returns_sse(self, streaming_app, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_AUDIO_SPEECH_DEFAULT_STREAM_FORMAT", "true")
+        client = TestClient(streaming_app)
+        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "pcm"})
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        assert "event: speech.audio.delta" in response.text
+
+    def test_env_default_stream_format_true_stream_true_sse_returns_sse(self, streaming_app, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_AUDIO_SPEECH_DEFAULT_STREAM_FORMAT", "true")
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "stream_format": "sse", "response_format": "pcm"},
+        )
+
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        assert "event: speech.audio.delta" in response.text
+
+    def test_env_default_stream_format_true_rejects_audio_streaming(self, streaming_app, monkeypatch):
+        monkeypatch.setenv("VLLM_OMNI_AUDIO_SPEECH_DEFAULT_STREAM_FORMAT", "true")
+        client = TestClient(streaming_app)
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream_format": "audio", "response_format": "pcm"},
+        )
+
+        assert response.status_code in (400, 422)
+        assert "text/event-stream" not in response.headers.get("content-type", "")
 
     def test_sse_rejects_unsupported_response_format(self, streaming_app):
         """stream_format=sse with a non-pcm/wav format must fail before streaming starts."""

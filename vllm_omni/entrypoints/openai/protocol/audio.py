@@ -4,6 +4,8 @@ from typing import Any, Literal
 import numpy as np
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
+from vllm_omni.entrypoints.openai.speech_stream_envs import audio_speech_sse_streaming_required
+
 _MAX_EMBEDDING_DIM = 8192
 
 
@@ -283,16 +285,22 @@ class OpenAICreateSpeechRequest(BaseModel):
         return self
 
     def is_raw_audio_stream(self) -> bool:
+        if audio_speech_sse_streaming_required():
+            return False
         return self.stream or self.stream_format == "audio"
 
     def is_sse_stream(self) -> bool:
+        if audio_speech_sse_streaming_required():
+            return self.stream or self.stream_format == "sse"
         return self.stream_format == "sse" and not self.is_raw_audio_stream()
 
     def is_streaming(self) -> bool:
-        return self.is_raw_audio_stream() or self.stream_format == "sse"
+        return self.is_raw_audio_stream() or self.is_sse_stream()
 
     @model_validator(mode="after")
     def validate_streaming_constraints(self) -> "OpenAICreateSpeechRequest":
+        if audio_speech_sse_streaming_required() and self.stream_format == "audio":
+            raise ValueError("stream_format='audio' is not supported when SSE streaming is required.")
         if self.is_streaming():
             if self.response_format not in ("pcm", "wav"):
                 raise ValueError(
