@@ -32,6 +32,37 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _count_audio_codec_tokens_from_value(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple)):
+        return sum(_count_audio_codec_tokens_from_value(item) for item in value)
+    shape = getattr(value, "shape", None)
+    if shape:
+        return int(shape[0])
+    try:
+        return len(value)
+    except TypeError:
+        return 0
+
+
+def _count_audio_codec_tokens_from_outputs(request_outputs: list[Any]) -> int:
+    total = 0
+    for ro in request_outputs:
+        containers = [ro]
+        outputs = getattr(ro, "outputs", None)
+        if outputs:
+            containers.extend(outputs)
+        for container in containers:
+            mm = getattr(container, "multimodal_output", None)
+            if not isinstance(mm, dict):
+                continue
+            codes = mm.get("codes")
+            if isinstance(codes, dict):
+                total += _count_audio_codec_tokens_from_value(codes.get("audio"))
+    return total
+
+
 @dataclass
 class _ReplicaMetrics:
     """Per-replica metrics accumulators owned by a stage pool."""
@@ -490,6 +521,7 @@ class StagePool:
         stage_gen_time_ms = (now - submit_ts) * 1000.0
 
         num_tokens_out = count_tokens_from_outputs(request_outputs)
+        audio_codec_tokens_out = _count_audio_codec_tokens_from_outputs(request_outputs)
         num_tokens_in = 0
         if self.stage_id == 0:
             for ro in request_outputs:
@@ -512,6 +544,7 @@ class StagePool:
             rx_decode_time_ms=0.0,
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
+            audio_codec_tokens_out=audio_codec_tokens_out,
             stage_stats=StageStats(
                 total_token=metrics.agg_total_tokens,
                 total_gen_time_ms=metrics.agg_total_gen_time_ms,

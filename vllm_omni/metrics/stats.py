@@ -41,6 +41,7 @@ class StageRequestStats:
     postprocess_time_ms: float = 0.0
     diffusion_metrics: dict[str, int] = None
     audio_generated_frames: int = 0
+    audio_codec_tokens_out: int = 0
     pipeline_timings: dict[str, float] | None = None
 
     @property

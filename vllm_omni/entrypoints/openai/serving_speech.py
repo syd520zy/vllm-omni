@@ -9,6 +9,7 @@ import re
 import struct
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -718,6 +719,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         try:
             from vllm_omni.model_executor.models.qwen3_tts.prompt_embeds_builder import (
                 Qwen3TTSPromptEmbedsBuilder,
+                build_assistant_text,
             )
 
             if self._tts_tokenizer is None:
@@ -732,10 +734,19 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             hf_config = self.engine_client.model_config.hf_config
             talker_config = hf_config.talker_config
             task_type = (tts_params.get("task_type") or ["CustomVoice"])[0]
+            text = tts_params.get("text", [""])[0] if isinstance(tts_params.get("text"), list) else tts_params.get("text", "")
+            assistant_text = build_assistant_text(text if isinstance(text, str) else "")
+
+            def tokenize_prompt(text: str) -> list[int]:
+                token_ids = self._tts_tokenizer(text, padding=False)["input_ids"]
+                if text == assistant_text:
+                    tts_params["_speech_usage_prompt_tokens"] = [max(0, len(token_ids) - 8)]
+                return token_ids
+
             return Qwen3TTSPromptEmbedsBuilder.estimate_prompt_len_from_additional_information(
                 additional_information=tts_params,
                 task_type=task_type,
-                tokenize_prompt=lambda t: self._tts_tokenizer(t, padding=False)["input_ids"],
+                tokenize_prompt=tokenize_prompt,
                 codec_language_id=getattr(talker_config, "codec_language_id", None),
                 spk_is_dialect=getattr(talker_config, "spk_is_dialect", None),
                 estimate_ref_code_len=self._estimate_ref_code_len,
@@ -1889,6 +1900,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         response_format: str = "pcm",
         raw_request: Request | None = None,
         request_start_s: float | None = None,
+        output_tracker: list[Any] | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -1915,6 +1927,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         try:
             async for res in generator:
+                if output_tracker is not None:
+                    output_tracker[:] = [res]
                 audio_output, audio_key = self._extract_audio_output(res)
                 if audio_key is None:
                     continue
@@ -2030,17 +2044,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         generator,
         request_id: str,
         response_format: str = "pcm",
+        tts_params: dict[str, Any] | None = None,
         raw_request: Request | None = None,
         request_start_s: float | None = None,
     ):
         """Generate OpenAI-style SSE events with base64 audio deltas."""
         try:
+            output_tracker: list[Any] = []
             async for chunk in self._generate_audio_chunks(
                 generator,
                 request_id,
                 response_format,
                 raw_request=raw_request,
                 request_start_s=request_start_s,
+                output_tracker=output_tracker,
             ):
                 payload = {
                     "type": "speech.audio.delta",
@@ -2049,7 +2066,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 }
                 data = json.dumps(payload, separators=(",", ":"))
                 yield f"event: speech.audio.delta\ndata: {data}\n\n"
-            done = json.dumps({"type": "speech.audio.done"}, separators=(",", ":"))
+            usage = self._create_speech_usage(
+                output_tracker[0] if output_tracker else None,
+                tts_params,
+            )
+            done = json.dumps({"type": "speech.audio.done", "usage": usage}, separators=(",", ":"))
             yield f"event: speech.audio.done\ndata: {done}\n\n"
         except asyncio.CancelledError:
             raise
@@ -2065,6 +2086,48 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             data = json.dumps(payload, separators=(",", ":"))
             yield f"event: speech.audio.error\ndata: {data}\n\n"
+
+    @staticmethod
+    def _coerce_token_count(value: Any) -> int:
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(count, 0)
+
+    def _audio_codec_tokens_from_metrics(self, metrics: Mapping[str, Any]) -> int:
+        codec_tokens = self._coerce_token_count(metrics.get("audio_codec_tokens_out"))
+        if codec_tokens:
+            return codec_tokens
+        stage_metrics = metrics.get("stage_metrics")
+        if not isinstance(stage_metrics, Mapping):
+            return 0
+        return sum(
+            self._coerce_token_count(stage_metric.get("audio_codec_tokens_out"))
+            for stage_metric in stage_metrics.values()
+            if isinstance(stage_metric, Mapping)
+        )
+
+    def _create_speech_usage(
+        self,
+        res,
+        tts_params: dict[str, Any] | None = None,
+    ) -> dict[str, int]:
+        metrics = getattr(res, "metrics", None) or {}
+        if not isinstance(metrics, Mapping):
+            request_output = getattr(res, "request_output", None)
+            metrics = getattr(request_output, "metrics", None) or {}
+        prompt_tokens = self._coerce_token_count(
+            (tts_params or {}).get("_speech_usage_prompt_tokens", [0])[0]
+            if isinstance((tts_params or {}).get("_speech_usage_prompt_tokens"), list)
+            else (tts_params or {}).get("_speech_usage_prompt_tokens")
+        )
+        completion_tokens = self._audio_codec_tokens_from_metrics(metrics) if isinstance(metrics, Mapping) else 0
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
 
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
@@ -3220,13 +3283,14 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         "Use stream=False or remove the speed parameter."
                     )
 
-                _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                _, generator, tts_params = await self._prepare_speech_generation(request, request_id=request_id)
                 if request.stream_format == "sse":
                     return StreamingResponse(
                         self._generate_audio_sse_events(
                             generator,
                             request_id,
                             response_format,
+                            tts_params=tts_params,
                             raw_request=raw_request,
                             request_start_s=request_start_s,
                         ),

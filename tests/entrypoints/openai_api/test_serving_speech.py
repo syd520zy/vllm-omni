@@ -1776,10 +1776,16 @@ class TestStreamingResponse:
                     self.prompt_logprobs = None
                     self.kv_transfer_params = None
 
+            metrics = (
+                {"stage_metrics": {"0": {"num_tokens_in": 2, "num_tokens_out": 1, "audio_codec_tokens_out": 9}}}
+                if finished
+                else {}
+            )
             return OmniRequestOutput(
                 stage_id=0,
                 final_output_type="audio",
                 request_output=MockRequestOutput(audio_tensor=chunk),
+                metrics=metrics,
                 finished=finished,
             )
 
@@ -1833,7 +1839,10 @@ class TestStreamingResponse:
 
         events = [event for event in response.text.strip().split("\n\n") if event]
         assert len(events) >= 2
-        assert events[-1] == 'event: speech.audio.done\ndata: {"type":"speech.audio.done"}'
+        assert events[-1] == (
+            'event: speech.audio.done\n'
+            'data: {"type":"speech.audio.done","usage":{"prompt_tokens":2,"completion_tokens":9,"total_tokens":11}}'
+        )
 
         delta_payloads = []
         for event in events[:-1]:

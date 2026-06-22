@@ -448,11 +448,30 @@ class OmniBase(PDDisaggregationMixin):
 
         output_type = getattr(engine_outputs, "final_output_type", stage_meta.final_output_type)
         images = getattr(engine_outputs, "images", []) if output_type == "image" else []
+        rid_key = str(req_id)
+        stage_metrics: dict[str, dict[str, int]] = {}
+        for evt in metrics.stage_events.get(rid_key, []):
+            stage_key = str(evt.stage_id)
+            entry = stage_metrics.setdefault(
+                stage_key,
+                {"num_tokens_in": 0, "num_tokens_out": 0, "audio_codec_tokens_out": 0},
+            )
+            if evt.stage_id == 0:
+                entry["num_tokens_in"] += int(evt.num_tokens_in)
+            entry["num_tokens_out"] += int(evt.num_tokens_out)
+            entry["audio_codec_tokens_out"] += int(getattr(evt, "audio_codec_tokens_out", 0) or 0)
+
+        raw_output_metrics = getattr(engine_outputs, "metrics", None)
+        output_metrics = dict(raw_output_metrics) if isinstance(raw_output_metrics, dict) else {}
+        if stage_metrics:
+            output_metrics["stage_metrics"] = stage_metrics
+
         return OmniRequestOutput(
             request_id=req_id or "",
             stage_id=stage_id,
             final_output_type=output_type,
             request_output=engine_outputs,
+            metrics=output_metrics,
             images=images,
             trajectory_latents=getattr(engine_outputs, "trajectory_latents", None),
             trajectory_timesteps=getattr(engine_outputs, "trajectory_timesteps", None),
