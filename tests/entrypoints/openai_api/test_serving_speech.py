@@ -1906,6 +1906,24 @@ class TestStreamingResponse:
                 final_output_type="audio",
                 request_output=MockRequestOutput(audio_tensor=chunk),
                 finished=finished,
+                metrics={
+                    "stage_metrics": {
+                        "0": {
+                            "stage_id": 0,
+                            "final_output_type": "text",
+                            "num_tokens_in": 7,
+                            "num_tokens_out": 3,
+                        },
+                        "1": {
+                            "stage_id": 1,
+                            "final_output_type": "audio",
+                            "num_tokens_in": 0,
+                            "num_tokens_out": 11,
+                        },
+                    }
+                }
+                if finished
+                else {},
             )
 
         async def mock_generate_streaming(*args, **kwargs):
@@ -1976,6 +1994,19 @@ class TestStreamingResponse:
         assert payload["type"] == "speech.audio.delta"
         assert payload["response_format"] == "pcm"
         assert base64.b64decode(payload["audio"])
+        done_line = next(
+            line
+            for event in body.split("\n\n")
+            if "event: speech.audio.done" in event
+            for line in event.splitlines()
+            if line.startswith("data: ")
+        )
+        done_payload = json.loads(done_line.removeprefix("data: "))
+        assert done_payload["usage"] == {
+            "prompt_tokens": 7,
+            "completion_tokens": 14,
+            "total_tokens": 21,
+        }
 
     def test_stream_true_prefers_raw_audio_over_sse(self, streaming_app):
         """stream=True keeps the existing raw audio stream behavior even with stream_format=sse."""
