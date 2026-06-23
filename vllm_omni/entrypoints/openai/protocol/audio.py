@@ -101,13 +101,6 @@ class OpenAICreateSpeechRequest(BaseModel):
         description=("Optional model-specific parameters passed directly to the model's extra_args."),
     )
 
-    @field_validator("stream_format")
-    @classmethod
-    def validate_stream_format(cls, v: str) -> str:
-        if v == "sse":
-            raise ValueError("'sse' is not a supported stream_format yet. Please use 'audio'.")
-        return v
-
     @field_validator("speaker_embedding")
     @classmethod
     def validate_speaker_embedding(cls, v: list[float] | None) -> list[float] | None:

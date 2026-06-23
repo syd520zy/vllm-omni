@@ -9,6 +9,7 @@ import re
 import struct
 import time
 from collections import OrderedDict
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from pathlib import Path
@@ -2073,6 +2074,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         response_format: str = "pcm",
         raw_request: Request | None = None,
         request_start_s: float | None = None,
+        output_tracker: list[Any] | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2099,6 +2101,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         try:
             async for res in generator:
+                if output_tracker is not None:
+                    output_tracker[:] = [res]
                 audio_output, audio_key = self._extract_audio_output(res)
                 if audio_key is None:
                     continue
@@ -2208,6 +2212,95 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         finally:
             if not artifact_ready:
                 self._discard_ref_audio_artifact_warmup(request_id)
+
+    @staticmethod
+    def _coerce_non_negative_int(value: Any) -> int:
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(count, 0)
+
+    @staticmethod
+    def _is_stage_zero(stage_key: Any, stage_metric: Mapping[str, Any]) -> bool:
+        stage_id = stage_metric.get("stage_id", stage_key)
+        try:
+            return int(stage_id) == 0
+        except (TypeError, ValueError):
+            return False
+
+    def _create_speech_usage_from_metrics(self, res: Any | None) -> dict[str, int]:
+        metrics = getattr(res, "metrics", None) or {}
+        if not isinstance(metrics, Mapping):
+            request_output = getattr(res, "request_output", None)
+            metrics = getattr(request_output, "metrics", None) or {}
+
+        stage_metrics = metrics.get("stage_metrics") if isinstance(metrics, Mapping) else None
+        prompt_tokens = 0
+        completion_tokens = 0
+        if isinstance(stage_metrics, Mapping):
+            for stage_key, stage_metric in stage_metrics.items():
+                if not isinstance(stage_metric, Mapping):
+                    continue
+                if self._is_stage_zero(stage_key, stage_metric):
+                    prompt_tokens += self._coerce_non_negative_int(stage_metric.get("num_tokens_in"))
+                completion_tokens += self._coerce_non_negative_int(stage_metric.get("num_tokens_out"))
+
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
+    async def _generate_audio_sse_events(
+        self,
+        generator,
+        request_id: str,
+        response_format: str = "pcm",
+        raw_request: Request | None = None,
+        request_start_s: float | None = None,
+    ):
+        """Generate OpenAI-style SSE events with base64 audio deltas."""
+        try:
+            output_tracker: list[Any] = []
+            async for chunk in self._generate_audio_chunks(
+                generator,
+                request_id,
+                response_format,
+                raw_request=raw_request,
+                request_start_s=request_start_s,
+                output_tracker=output_tracker,
+            ):
+                payload = {
+                    "type": "speech.audio.delta",
+                    "audio": base64.b64encode(chunk).decode("ascii"),
+                    "response_format": response_format,
+                }
+                data = json.dumps(payload, separators=(",", ":"))
+                yield f"event: speech.audio.delta\ndata: {data}\n\n"
+            usage = self._create_speech_usage_from_metrics(
+                output_tracker[0] if output_tracker else None
+            )
+            done = json.dumps(
+                {"type": "speech.audio.done", "usage": usage},
+                separators=(",", ":"),
+            )
+            yield f"event: speech.audio.done\ndata: {done}\n\n"
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            payload = {
+                "type": "speech.audio.error",
+                "error": {
+                    "message": str(e),
+                    "type": "server_error",
+                    "param": None,
+                    "code": None,
+                },
+            }
+            data = json.dumps(payload, separators=(",", ":"))
+            yield f"event: speech.audio.error\ndata: {data}\n\n"
+            raise
 
     @staticmethod
     def _extract_audio_output(res) -> tuple[dict | None, str | None]:
@@ -3354,7 +3447,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             )
 
         try:
-            if request.stream:
+            use_sse_stream = request.stream_format == "sse" and not request.stream
+            if request.stream or use_sse_stream:
                 # Determine response format and media type for streaming
                 response_format = (request.response_format or "wav").lower()
 
@@ -3372,8 +3466,20 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         "Use stream=False or remove the speed parameter."
                     )
 
-                media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 _, generator, _ = await self._prepare_speech_generation(request, request_id=request_id)
+                if use_sse_stream:
+                    return StreamingResponse(
+                        self._generate_audio_sse_events(
+                            generator,
+                            request_id,
+                            response_format,
+                            raw_request=raw_request,
+                            request_start_s=request_start_s,
+                        ),
+                        media_type="text/event-stream",
+                    )
+
+                media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
                 return StreamingResponse(
                     self._generate_audio_chunks(
                         generator,
