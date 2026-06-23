@@ -2801,9 +2801,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 }
                 data = json.dumps(payload, separators=(",", ":"))
                 yield f"event: speech.audio.delta\ndata: {data}\n\n"
-            usage = self._create_speech_usage_from_metrics(
-                output_tracker[0] if output_tracker else None
-            )
+            usage = self._create_speech_usage_from_metrics(output_tracker[0] if output_tracker else None)
             done = json.dumps(
                 {"type": "speech.audio.done", "usage": usage},
                 separators=(",", ":"),
