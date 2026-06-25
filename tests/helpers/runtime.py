@@ -1786,6 +1786,7 @@ class OpenAIClientHandler:
             "seed",
             "instructions",
             "speed",
+            "stream_format",
         ):
             if key in request_config:
                 extra_body[key] = request_config[key]

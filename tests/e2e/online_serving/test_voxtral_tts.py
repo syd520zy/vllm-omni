@@ -68,6 +68,7 @@ class TestVoxtralTTSFixedVoice:
                 "voice": "casual_female",
                 "language": "English",
                 "stream": True,
+                "stream_format": "audio",
                 "response_format": "pcm",
                 "timeout": 120.0,
                 "min_audio_bytes": _MIN_AUDIO_BYTES_BASIC,

@@ -3867,8 +3867,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         Streaming is supported via the ``stream=True`` switch or ``stream_format='sse'``,
         which return OpenAI ``speech.audio.*`` SSE events. ``stream_format='audio'``
         opts into raw audio streaming with ``response_format='pcm'`` or ``'wav'``.
-        Each Code2Wav chunk is yielded as raw audio bytes as soon as it is decoded.
-        For WAV format, a header with placeholder size values is emitted first.
+        Raw audio streaming yields each Code2Wav chunk as raw bytes as soon as it is
+        decoded. Raw WAV streaming emits a header with placeholder size values first.
         """
         if self._diffusion_mode:
             return await self._create_diffusion_speech(request)

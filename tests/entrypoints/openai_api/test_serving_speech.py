@@ -2762,7 +2762,10 @@ class TestWAVStreaming:
     def test_wav_streaming_success(self, wav_streaming_app):
         """Test WAV format streaming returns correct content type and includes WAV header."""
         client = TestClient(wav_streaming_app)
-        response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": "wav"})
+        response = client.post(
+            "/v1/audio/speech",
+            json={"input": "Hello", "stream": True, "stream_format": "audio", "response_format": "wav"},
+        )
 
         assert response.status_code == 200
         assert "audio/wav" in response.headers["content-type"]
@@ -2781,7 +2784,10 @@ class TestWAVStreaming:
 
         unsupported_formats = ["mp3"]
         for fmt in unsupported_formats:
-            response = client.post("/v1/audio/speech", json={"input": "Hello", "stream": True, "response_format": fmt})
+            response = client.post(
+                "/v1/audio/speech",
+                json={"input": "Hello", "stream": True, "stream_format": "audio", "response_format": fmt},
+            )
             assert response.status_code == 422
 
 

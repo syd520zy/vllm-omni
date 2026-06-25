@@ -122,7 +122,8 @@ Content-Type: application/json
 | `max_new_tokens` | integer | 2048 | Maximum tokens to generate |
 | `initial_codec_chunk_frames` | integer | null | Per-request initial chunk size override for TTFA tuning. When null, IC is computed dynamically based on server load. |
 | `non_streaming_mode` | bool | null | Qwen3-TTS prompt construction mode override. Does not affect HTTP response streaming or async-chunk pipelining. When null, Qwen3-TTS uses model defaults: Base=false, CustomVoice/VoiceDesign=true. |
-| `stream` | bool | false | Stream raw PCM chunks as they are decoded (requires `response_format="pcm"`) |
+| `stream` | bool | false | When true, stream OpenAI `speech.audio.*` SSE events (requires `response_format="pcm"` or `"wav"`). For raw PCM/WAV byte streaming, set `stream_format="audio"`. |
+| `stream_format` | string | null | `"audio"` streams raw PCM/WAV bytes; `"sse"` (or `stream=true`) streams OpenAI `speech.audio.*` SSE events. |
 
 **Supported languages:** Only applicable to Qwen3-TTS. Derived from the model configuration (`talker_config.codec_language_id` in the checkpoint's `config.json`), plus `Auto`, which is always accepted. Official Qwen3-TTS checkpoints support: Auto, Chinese, English, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian.
 
