@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
-import base64
 import dataclasses
 import io
 import json
@@ -20,7 +19,6 @@ from numbers import Integral
 from pathlib import Path
 from typing import Annotated, Any, Literal, cast
 
-import httpx
 import numpy as np
 import vllm.envs as envs
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile, WebSocket
@@ -85,6 +83,7 @@ from vllm.entrypoints.speech_to_text.translation.serving import (
     OpenAIServingTranslation,
 )
 from vllm.logger import init_logger
+from vllm.multimodal.media import MediaConnector
 from vllm.tasks import POOLING_TASKS
 from vllm.tool_parsers import ToolParserManager
 from vllm.utils import random_uuid
@@ -110,6 +109,7 @@ from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
     ImageGenerationResponse,
+    ResponseFormat,
 )
 from vllm_omni.entrypoints.openai.protocol.videos import (
     SecondStr,
@@ -132,6 +132,7 @@ from vllm_omni.entrypoints.openai.serving_video import (
     ReferenceImage,
     ReferenceVideo,
 )
+from vllm_omni.entrypoints.openai.serving_video_output_stream import OmniStreamingVideoOutputHandler
 from vllm_omni.entrypoints.openai.serving_video_stream import create_streaming_video_handler
 from vllm_omni.entrypoints.openai.stage_params import (
     build_stage_sampling_params_list,
@@ -345,6 +346,38 @@ def _create_engine_error_json_response(
 
     payload, status_code = _build_engine_error_payload(exc, request_id=request_id)
     return JSONResponse(content=payload, status_code=status_code)
+
+
+def _error_response_to_json_response(
+    err: ErrorResponse,
+    *,
+    status_code: HTTPStatus | int | None = None,
+    default_status_code: HTTPStatus | int = HTTPStatus.BAD_REQUEST,
+) -> JSONResponse:
+    resolved_status = int(
+        status_code
+        if status_code is not None
+        else (err.error.code if err.error and err.error.code is not None else default_status_code)
+    )
+    payload = err.model_dump()
+    if err.error:
+        payload["error"]["code"] = resolved_status
+    return JSONResponse(content=payload, status_code=resolved_status)
+
+
+def _create_speech_error_json_response(
+    raw_request: Request,
+    message: str,
+    *,
+    err_type: str = "BadRequestError",
+    status_code: HTTPStatus = HTTPStatus.BAD_REQUEST,
+) -> JSONResponse:
+    err = base(raw_request).create_error_response(
+        message=message,
+        err_type=err_type,
+        status_code=status_code,
+    )
+    return _error_response_to_json_response(err, status_code=status_code)
 
 
 class _DiffusionServingModels:
@@ -739,6 +772,11 @@ async def omni_init_app_state(
         diffusion_stage_configs = engine_client.stage_configs if hasattr(engine_client, "stage_configs") else None
         state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
             diffusion_engine=engine_client,  # type: ignore
+            model_name=model_name,
+            stage_configs=diffusion_stage_configs,
+        )
+        state.openai_streaming_video_output = OmniStreamingVideoOutputHandler(
+            engine_client=engine_client,
             model_name=model_name,
             stage_configs=diffusion_stage_configs,
         )
@@ -1231,14 +1269,16 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Speech API",
             )
-        return base_server.create_error_response(message="The model does not support Speech API")
+        err = base_server.create_error_response(
+            message="The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return result
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1267,14 +1307,16 @@ async def create_speech_batch(request: BatchSpeechRequest, raw_request: Request)
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Speech API",
             )
-        return base_server.create_error_response(message="The model does not support Speech API")
+        err = base_server.create_error_response(
+            message="The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_speech_batch(request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return JSONResponse(content=result.model_dump())
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1305,14 +1347,16 @@ async def create_audio_generate(request: OpenAICreateAudioGenerateRequest, raw_r
                 status_code=HTTPStatus.NOT_FOUND.value,
                 detail="The model does not support Audio Generate API",
             )
-        return base_server.create_error_response(message="The model does not support Audio Generate API")
+        err = base_server.create_error_response(
+            message="The model does not support Audio Generate API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
+        return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
     try:
         result = await handler.create_audio_generate(request, raw_request)
         if isinstance(result, ErrorResponse):
-            return JSONResponse(
-                content=result.model_dump(),
-                status_code=result.error.code if result.error else 400,
-            )
+            return _error_response_to_json_response(result)
         return result
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1342,7 +1386,12 @@ async def list_voices(raw_request: Request):
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     # Get all speakers (both model built-in and uploaded)
     speakers = sorted(handler.supported_speakers) if handler.supported_speakers else []
@@ -1374,6 +1423,7 @@ async def list_voices(raw_request: Request):
     responses={
         HTTPStatus.OK.value: {"model": dict},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
+        HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
@@ -1415,12 +1465,17 @@ async def upload_voice(
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     try:
         if speaker_embedding is not None and audio_sample is not None:
-            return base(raw_request).create_error_response(
-                message="'audio_sample' and 'speaker_embedding' are mutually exclusive"
+            return _create_speech_error_json_response(
+                raw_request, "'audio_sample' and 'speaker_embedding' are mutually exclusive"
             )
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
@@ -1433,23 +1488,29 @@ async def upload_voice(
                 speaker_description=speaker_description,
             )
         else:
-            return base(raw_request).create_error_response(
-                message="Either 'audio_sample' or 'speaker_embedding' must be provided"
+            return _create_speech_error_json_response(
+                raw_request, "Either 'audio_sample' or 'speaker_embedding' must be provided"
             )
 
         return JSONResponse(content={"success": True, "voice": result})
 
     except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
+        return _create_speech_error_json_response(raw_request, str(e))
     except Exception as e:
         logger.exception(f"Failed to upload voice: {e}")
-        return base(raw_request).create_error_response(message=f"Failed to upload voice: {str(e)}")
+        return _create_speech_error_json_response(
+            raw_request,
+            f"Failed to upload voice: {str(e)}",
+            err_type="InternalServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 @router.delete(
     "/v1/audio/voices/{name}",
     responses={
         HTTPStatus.OK.value: {"model": dict},
+        HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
@@ -1469,24 +1530,36 @@ async def delete_voice(name: str, raw_request: Request):
     """
     handler = Omnispeech(raw_request)
     if handler is None:
-        return base(raw_request).create_error_response(message="The model does not support Speech API")
+        return _create_speech_error_json_response(
+            raw_request,
+            "The model does not support Speech API",
+            err_type="NotFoundError",
+            status_code=HTTPStatus.NOT_FOUND,
+        )
 
     try:
         # Delete the voice
         success = await handler.delete_voice(name)
         if not success:
-            return JSONResponse(
-                content={"success": False, "error": f"Voice '{name}' not found"},
-                status_code=HTTPStatus.NOT_FOUND.value,
+            return _create_speech_error_json_response(
+                raw_request,
+                f"Voice '{name}' not found",
+                err_type="NotFoundError",
+                status_code=HTTPStatus.NOT_FOUND,
             )
 
         return JSONResponse(content={"success": True, "message": f"Voice '{name}' deleted successfully"})
 
     except ValueError as e:
-        return base(raw_request).create_error_response(message=str(e))
+        return _create_speech_error_json_response(raw_request, str(e))
     except Exception as e:
         logger.exception(f"Failed to delete voice '{name}': {e}")
-        return base(raw_request).create_error_response(message=f"Failed to delete voice: {str(e)}")
+        return _create_speech_error_json_response(
+            raw_request,
+            f"Failed to delete voice: {str(e)}",
+            err_type="InternalServerError",
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+        )
 
 
 @router.websocket("/v1/audio/speech/stream")
@@ -1520,6 +1593,23 @@ async def streaming_video_chat(websocket: WebSocket):
             {
                 "type": "error",
                 "message": "Streaming video chat is not available",
+            }
+        )
+        await websocket.close()
+        return
+    await handler.handle_session(websocket)
+
+
+@router.websocket("/v1/realtime/video")
+async def streaming_video_output(websocket: WebSocket):
+    """WebSocket endpoint for streaming generated video output chunks."""
+    handler = getattr(websocket.app.state, "openai_streaming_video_output", None)
+    if handler is None:
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "type": "error",
+                "message": "Streaming video generation is not available",
             }
         )
         await websocket.close()
@@ -1616,6 +1706,7 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
 @router.post(
     "/v1/images/generations",
     dependencies=[Depends(validate_json_request)],
+    response_model=None,
     responses={
         HTTPStatus.OK.value: {"model": ImageGenerationResponse},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
@@ -1624,7 +1715,9 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
     },
 )
 @with_cancellation
-async def generate_images(request: ImageGenerationRequest, raw_request: Request):
+async def generate_images(
+    request: ImageGenerationRequest, raw_request: Request
+) -> ImageGenerationResponse | StreamingResponse:
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
@@ -1816,7 +1909,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         }
         if request.size:
             response_kwargs["size"] = size_str
-        return ImageGenerationResponse(**response_kwargs)
+        response = ImageGenerationResponse(**response_kwargs)
+        if request.response_format != ResponseFormat.FILE:
+            return response
+        return response.stream_response()
 
     except (EngineGenerateError, EngineDeadError) as exc:
         return _create_engine_error_json_response(raw_request, exc)
@@ -1941,17 +2037,23 @@ async def edit_images(
         # Match the offline path: RGB normalize when the caller opts into
         # Hunyuan-aware behavior. RGBA/P uploads otherwise diverge from offline.
         normalize_edit_images_rgb = bot_task is not None or sys_type is not None
-        pil_images = await _load_input_images(input_images_list, normalize_rgb=normalize_edit_images_rgb)
+        pil_images = await _load_input_images(
+            input_images_list,
+            engine_client.model_config,
+            normalize_rgb=normalize_edit_images_rgb,
+        )
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
 
         if mask_image is not None:
             # Mask role is different (alpha channel matters); never normalize.
-            loaded = await _load_input_images([mask_image], normalize_rgb=False)
+            loaded = await _load_input_images([mask_image], engine_client.model_config, normalize_rgb=False)
             prompt["multi_modal_data"]["mask_image"] = loaded[0]
 
         if reference_image is not None:
-            loaded = await _load_input_images([reference_image], normalize_rgb=normalize_edit_images_rgb)
+            loaded = await _load_input_images(
+                [reference_image], engine_client.model_config, normalize_rgb=normalize_edit_images_rgb
+            )
             prompt["multi_modal_data"]["reference_image"] = loaded[0]
 
         # 3 Build sample params
@@ -2438,41 +2540,41 @@ def _extract_images_from_result(result: Any) -> list[Any]:
 
 async def _load_input_images(
     inputs: list[str],
+    model_config: Any,
     *,
     normalize_rgb: bool = True,
 ) -> list[Image.Image]:
+    """Load images from data URIs, http(s) URLs, file:// URIs, or UploadFiles.
+
+    http(s) and ``file:`` URLs are fetched through vLLM's ``MediaConnector`` which
+    respects ``--allowed-media-domains`` and ``--allowed-local-media-path``
+    to prevent SSRF.
     """
-    convert to PIL.Image.Image list
-    """
+
     if isinstance(inputs, str):
         inputs = [inputs]
+
+    connector = MediaConnector(
+        allowed_local_media_path=model_config.allowed_local_media_path,
+        allowed_media_domains=model_config.allowed_media_domains,
+    )
 
     images: list[Image.Image] = []
 
     for inp in inputs:
-        # 1. URL + base64
-        if isinstance(inp, str) and inp.startswith("data:image"):
+        if isinstance(inp, str):
+            # http(s), data: and file: all handled by MediaConnector
             try:
-                _, b64_data = inp.split(",", 1)
-                image_bytes = base64.b64decode(b64_data)
-                img = Image.open(io.BytesIO(image_bytes))
-                images.append(img)
+                # Use RGBA to preserve alpha for transparent PNG.
+                result = await connector.fetch_image_async(
+                    inp,
+                    image_mode="RGBA",
+                )
+                images.append(result.media)
             except Exception as e:
-                raise ValueError(f"Invalid base64 image: {e}")
-
-        # 2. URL
-        elif isinstance(inp, str) and inp.startswith("http"):
-            async with httpx.AsyncClient(timeout=60) as client:
-                try:
-                    resp = await client.get(inp)
-                    resp.raise_for_status()
-                    img = Image.open(io.BytesIO(resp.content))
-                    images.append(img)
-                except Exception as e:
-                    raise ValueError(f"Failed to download image from URL {inp}: {e}")
-
-        # 3. UploadFile
+                raise ValueError(f"Failed to load image: {e}") from e
         elif hasattr(inp, "file"):
+            # UploadFile
             try:
                 img_data = await inp.read()
                 img = Image.open(io.BytesIO(img_data))
@@ -2924,6 +3026,7 @@ async def _parse_video_form(
             request.image_reference,
             request.video_reference,
             input_reference_bytes,
+            model_config=handler._engine_client.model_config,
             max_video_frames=decode_spec.max_frames,
             video_keep=decode_spec.keep,
         )
@@ -2935,8 +3038,15 @@ async def _parse_video_form(
 
     reference_audio: ReferenceAudio | None = None
     if request.audio_reference is not None:
+        audio_connector = MediaConnector(
+            allowed_local_media_path=handler._engine_client.model_config.allowed_local_media_path,
+            allowed_media_domains=handler._engine_client.model_config.allowed_media_domains,
+        )
         try:
-            audio_path = await decode_audio_url(request.audio_reference.audio_url)
+            audio_path = await decode_audio_url(
+                request.audio_reference.audio_url,
+                audio_connector,
+            )
         except InvalidInputReferenceError as exc:
             raise HTTPException(400, detail=str(exc)) from exc
         reference_audio = ReferenceAudio(path=audio_path)
