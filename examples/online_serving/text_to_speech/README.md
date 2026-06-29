@@ -364,6 +364,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         \"input\": \"Hello, streaming output from MOSS-TTS-Nano.\",
         \"ref_audio\": \"data:audio/wav;base64,${REF_AUDIO}\",
         \"stream\": true,
+        \"stream_format\": \"audio\",
         \"response_format\": \"pcm\"
     }" --no-buffer | play -t raw -r 48000 -e signed -b 16 -c 1 -
 ```
