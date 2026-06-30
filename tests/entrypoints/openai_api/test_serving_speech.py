@@ -3368,7 +3368,7 @@ class TestTTSAsyncOffloading:
         )
         qwen3_tts_server._estimate_prompt_len_async = mocker.AsyncMock(return_value=512)
         mock_coerce = mocker.patch(
-            "vllm_omni.entrypoints.openai.serving_speech._coerce_sampling_params_streaming",
+            "vllm_omni.entrypoints.openai.serving_speech.coerce_param_message_types",
             return_value=qwen3_tts_server.engine_client.default_sampling_params_list,
         )
         request = OpenAICreateSpeechRequest(input="hello", stream=True, response_format="pcm")
